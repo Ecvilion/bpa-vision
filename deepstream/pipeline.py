@@ -1,0 +1,525 @@
+"""DeepStream Python pipeline for BPA Vision Stage 1.
+
+Pipeline per camera:
+  rtspsrc → rtph264/5depay → nvv4l2decoder → queue →
+  nvstreammux → queue → nvinfer (pose) → queue →
+  nvvideoconvert → queue → nvdsosd → queue →
+  tee → queue → filesink (encoded H264)
+      └→ queue → fakesink
+
+Python probes on nvinfer src pad:
+  1. Parse output tensors → FrameObservation
+  2. Attach bbox/keypoints as OSD display meta
+  3. Write JSONL records
+
+Usage:
+  python3 deepstream/pipeline.py --config configs/example.yaml
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstRtspServer", "1.0")
+from gi.repository import GLib, Gst
+
+import pyds
+
+from yolo26_parser import (
+    NUM_KEYPOINTS,
+    PoseDetection,
+    parse_pose_tensor,
+    detections_to_normalized,
+)
+
+logger = logging.getLogger("bpa_vision.pipeline")
+
+# ── Constants ──────────────────────────────────────────────────────────────
+MUXER_WIDTH = 1920
+MUXER_HEIGHT = 1080
+MUXER_BATCH_TIMEOUT = 40000  # μs
+GPU_ID = 0
+
+# COCO skeleton for OSD drawing (pairs of keypoint indices)
+SKELETON_PAIRS = [
+    (0, 1), (0, 2), (1, 3), (2, 4),  # head
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # arms
+    (5, 11), (6, 12), (11, 12),  # torso
+    (11, 13), (13, 15), (12, 14), (14, 16),  # legs
+]
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def make_element(factory: str, name: str) -> Gst.Element:
+    """Create a GStreamer element or raise."""
+    elem = Gst.ElementFactory.make(factory, name)
+    if elem is None:
+        raise RuntimeError(f"Failed to create element: {factory} ({name})")
+    return elem
+
+
+def make_queue(name: str) -> Gst.Element:
+    """Create a queue element with reasonable defaults."""
+    q = make_element("queue", name)
+    q.set_property("max-size-buffers", 4)
+    q.set_property("leaky", 2)  # leak downstream
+    return q
+
+
+class PipelineManager:
+    """Builds and runs the DeepStream pipeline for multiple RTSP sources."""
+
+    def __init__(
+        self,
+        sources: list[dict],
+        pose_config: str,
+        output_dir: str = "/app/output",
+        conf_threshold: float = 0.25,
+    ):
+        self.sources = sources
+        self.pose_config = pose_config
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.conf_threshold = conf_threshold
+
+        self.pipeline: Gst.Pipeline | None = None
+        self.loop: GLib.MainLoop | None = None
+        self.jsonl_files: dict[int, object] = {}
+        self.frame_counters: dict[int, int] = {}
+
+    # ── Build pipeline ─────────────────────────────────────────────────
+
+    def build(self) -> Gst.Pipeline:
+        Gst.init(None)
+        self.pipeline = Gst.Pipeline.new("bpa-vision-pipeline")
+
+        # ── Streammux ──
+        streammux = make_element("nvstreammux", "muxer")
+        streammux.set_property("batch-size", len(self.sources))
+        streammux.set_property("width", MUXER_WIDTH)
+        streammux.set_property("height", MUXER_HEIGHT)
+        streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT)
+        streammux.set_property("gpu-id", GPU_ID)
+        streammux.set_property("nvbuf-memory-type", 0)  # default
+        self.pipeline.add(streammux)
+
+        # ── Source branches ──
+        for idx, src in enumerate(self.sources):
+            self._add_source_branch(idx, src, streammux)
+
+        # ── Queue after muxer ──
+        q_mux = make_queue("q_after_mux")
+        self.pipeline.add(q_mux)
+        streammux.link(q_mux)
+
+        # ── nvinfer (pose) ──
+        nvinfer = make_element("nvinfer", "pose-infer")
+        nvinfer.set_property("config-file-path", self.pose_config)
+        nvinfer.set_property("gpu-id", GPU_ID)
+        self.pipeline.add(nvinfer)
+        q_inf = make_queue("q_after_infer")
+        self.pipeline.add(q_inf)
+        q_mux.link(nvinfer)
+        nvinfer.link(q_inf)
+
+        # ── nvvideoconvert (for OSD) ──
+        nvvidconv = make_element("nvvideoconvert", "nvvidconv")
+        nvvidconv.set_property("gpu-id", GPU_ID)
+        self.pipeline.add(nvvidconv)
+        q_conv = make_queue("q_after_conv")
+        self.pipeline.add(q_conv)
+        q_inf.link(nvvidconv)
+        nvvidconv.link(q_conv)
+
+        # ── nvdsosd ──
+        osd = make_element("nvdsosd", "osd")
+        osd.set_property("process-mode", 1)  # GPU
+        osd.set_property("gpu-id", GPU_ID)
+        self.pipeline.add(osd)
+        q_osd = make_queue("q_after_osd")
+        self.pipeline.add(q_osd)
+        q_conv.link(osd)
+        osd.link(q_osd)
+
+        # ── tee ──
+        tee = make_element("tee", "tee")
+        self.pipeline.add(tee)
+        q_osd.link(tee)
+
+        # ── Branch 1: encode → filesink ──
+        q_enc = make_queue("q_encode")
+        nvvidconv_enc = make_element("nvvideoconvert", "nvvidconv_enc")
+        nvvidconv_enc.set_property("gpu-id", GPU_ID)
+        capsfilter = make_element("capsfilter", "caps_enc")
+        capsfilter.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
+        )
+        encoder = make_element("nvv4l2h264enc", "encoder")
+        encoder.set_property("bitrate", 4000000)
+        h264parse = make_element("h264parse", "h264parse")
+        splitmux = make_element("splitmuxsink", "splitmux")
+        splitmux.set_property(
+            "location",
+            str(self.output_dir / "output_%02d.mp4"),
+        )
+        splitmux.set_property("max-size-time", 60 * Gst.SECOND)  # 60s segments
+
+        for el in [q_enc, nvvidconv_enc, capsfilter, encoder, h264parse, splitmux]:
+            self.pipeline.add(el)
+
+        tee.link(q_enc)
+        q_enc.link(nvvidconv_enc)
+        nvvidconv_enc.link(capsfilter)
+        capsfilter.link(encoder)
+        encoder.link(h264parse)
+        h264parse.link(splitmux)
+
+        # ── Branch 2: fakesink (keeps pipeline running if no file needed) ──
+        q_fake = make_queue("q_fake")
+        fakesink = make_element("fakesink", "fakesink")
+        fakesink.set_property("sync", 0)
+        self.pipeline.add(q_fake)
+        self.pipeline.add(fakesink)
+        tee.link(q_fake)
+        q_fake.link(fakesink)
+
+        # ── Probe on nvinfer src pad to parse tensors + draw OSD ──
+        infer_src_pad = nvinfer.get_static_pad("src")
+        if infer_src_pad:
+            infer_src_pad.add_probe(
+                Gst.PadProbeType.BUFFER, self._infer_src_probe, None
+            )
+
+        # ── Open JSONL files ──
+        for idx, src in enumerate(self.sources):
+            cam_id = src.get("camera_id", f"cam_{idx}")
+            jsonl_path = self.output_dir / f"{cam_id}_observations.jsonl"
+            self.jsonl_files[idx] = open(jsonl_path, "w", encoding="utf-8")
+            self.frame_counters[idx] = 0
+
+        return self.pipeline
+
+    def _add_source_branch(
+        self, idx: int, src: dict, streammux: Gst.Element
+    ) -> None:
+        """Add one RTSP source → decode → queue → muxer sink pad."""
+        uri = src["stream_uri"]
+
+        rtspsrc = make_element("rtspsrc", f"rtspsrc_{idx}")
+        rtspsrc.set_property("location", uri)
+        rtspsrc.set_property("latency", 200)
+        rtspsrc.set_property("drop-on-latency", True)
+
+        depay = make_element("rtph264depay", f"depay_{idx}")
+        parse = make_element("h264parse", f"h264parse_src_{idx}")
+        decoder = make_element("nvv4l2decoder", f"decoder_{idx}")
+        decoder.set_property("gpu-id", GPU_ID)
+        q_dec = make_queue(f"q_decode_{idx}")
+
+        for el in [rtspsrc, depay, parse, decoder, q_dec]:
+            self.pipeline.add(el)
+
+        # rtspsrc has dynamic pads — connect on pad-added
+        rtspsrc.connect("pad-added", self._on_rtspsrc_pad_added, depay)
+        depay.link(parse)
+        parse.link(decoder)
+        decoder.link(q_dec)
+
+        # Request a sink pad on streammux
+        pad_name = f"sink_{idx}"
+        mux_sink = streammux.request_pad_simple(pad_name)
+        q_src_pad = q_dec.get_static_pad("src")
+        q_src_pad.link(mux_sink)
+
+    @staticmethod
+    def _on_rtspsrc_pad_added(
+        rtspsrc: Gst.Element, pad: Gst.Pad, depay: Gst.Element
+    ) -> None:
+        """Link rtspsrc dynamic pad to depayloader."""
+        caps = pad.get_current_caps()
+        if caps is None:
+            return
+        struct = caps.get_structure(0)
+        name = struct.get_name()
+        if name.startswith("application/x-rtp"):
+            sink_pad = depay.get_static_pad("sink")
+            if not sink_pad.is_linked():
+                pad.link(sink_pad)
+
+    # ── Probe callback ─────────────────────────────────────────────────
+
+    def _infer_src_probe(
+        self, pad: Gst.Pad, info: Gst.PadProbeInfo, user_data
+    ) -> Gst.PadProbeReturn:
+        """Parse nvinfer output tensors, write JSONL, add OSD metadata."""
+        buf = info.get_buffer()
+        if buf is None:
+            return Gst.PadProbeReturn.OK
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+        if batch_meta is None:
+            return Gst.PadProbeReturn.OK
+
+        l_frame = batch_meta.frame_meta_list
+        while l_frame is not None:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            except StopIteration:
+                break
+
+            source_id = frame_meta.source_id
+            self.frame_counters.setdefault(source_id, 0)
+            self.frame_counters[source_id] += 1
+            frame_idx = self.frame_counters[source_id]
+
+            # Parse output tensors
+            detections = self._extract_pose_detections(frame_meta)
+
+            # Convert to normalized space and write JSONL
+            if detections:
+                normalized = detections_to_normalized(
+                    detections, MUXER_WIDTH, MUXER_HEIGHT
+                )
+                now = datetime.now(timezone.utc).isoformat()
+                cam_id = self.sources[source_id].get(
+                    "camera_id", f"cam_{source_id}"
+                ) if source_id < len(self.sources) else f"cam_{source_id}"
+
+                for det_norm in normalized:
+                    record = {
+                        "observation_id": str(uuid4()),
+                        "camera_id": cam_id,
+                        "frame_idx": frame_idx,
+                        "timestamp": now,
+                        **det_norm,
+                    }
+                    if source_id in self.jsonl_files:
+                        self.jsonl_files[source_id].write(
+                            json.dumps(record) + "\n"
+                        )
+
+                # Add OSD display meta (bboxes + keypoints)
+                self._add_osd_meta(frame_meta, detections)
+
+            try:
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+
+        # Flush JSONL periodically
+        for f in self.jsonl_files.values():
+            f.flush()
+
+        return Gst.PadProbeReturn.OK
+
+    def _extract_pose_detections(
+        self, frame_meta
+    ) -> list[PoseDetection]:
+        """Extract pose detections from tensor output meta."""
+        detections = []
+
+        l_user = frame_meta.frame_user_meta_list
+        while l_user is not None:
+            try:
+                user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+            except StopIteration:
+                break
+
+            if (
+                user_meta.base_meta.meta_type
+                == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META
+            ):
+                tensor_meta = pyds.NvDsInferTensorMeta.cast(
+                    user_meta.user_meta_data
+                )
+                detections = parse_pose_tensor(
+                    tensor_meta,
+                    conf_threshold=self.conf_threshold,
+                    input_width=640,
+                    input_height=640,
+                    frame_width=MUXER_WIDTH,
+                    frame_height=MUXER_HEIGHT,
+                )
+                break
+
+            try:
+                l_user = l_user.next
+            except StopIteration:
+                break
+
+        return detections
+
+    def _add_osd_meta(
+        self, frame_meta, detections: list[PoseDetection]
+    ) -> None:
+        """Attach bounding boxes and pose skeleton lines to OSD display meta."""
+        display_meta = pyds.nvds_acquire_display_meta_from_pool(
+            frame_meta.base_meta.batch_meta
+        )
+
+        rect_idx = 0
+        line_idx = 0
+
+        for det in detections:
+            # Draw bounding box
+            if rect_idx < display_meta.MAX_ELEMENTS_IN_DISPLAY_META:
+                rect = pyds.NvOSD_RectParams.cast(
+                    display_meta.rect_params[rect_idx]
+                )
+                rect.left = int(det.x1)
+                rect.top = int(det.y1)
+                rect.width = int(det.x2 - det.x1)
+                rect.height = int(det.y2 - det.y1)
+                rect.border_width = 2
+                rect.border_color.set(0.0, 1.0, 0.0, 1.0)  # green
+                rect.has_bg_color = 0
+                rect_idx += 1
+
+            # Draw skeleton lines
+            if isinstance(det, PoseDetection) and det.keypoints:
+                for i, j in SKELETON_PAIRS:
+                    kp_i = det.keypoints[i]
+                    kp_j = det.keypoints[j]
+                    # Only draw if both keypoints are confident
+                    if kp_i[2] < 0.3 or kp_j[2] < 0.3:
+                        continue
+                    if line_idx >= display_meta.MAX_ELEMENTS_IN_DISPLAY_META:
+                        # Need a new display meta
+                        display_meta.num_rects = rect_idx
+                        display_meta.num_lines = line_idx
+                        pyds.nvds_add_display_meta_to_frame(
+                            frame_meta, display_meta
+                        )
+                        display_meta = pyds.nvds_acquire_display_meta_from_pool(
+                            frame_meta.base_meta.batch_meta
+                        )
+                        rect_idx = 0
+                        line_idx = 0
+
+                    line = pyds.NvOSD_LineParams.cast(
+                        display_meta.line_params[line_idx]
+                    )
+                    line.x1 = int(kp_i[0])
+                    line.y1 = int(kp_i[1])
+                    line.x2 = int(kp_j[0])
+                    line.y2 = int(kp_j[1])
+                    line.line_width = 2
+                    line.line_color.set(0.0, 1.0, 1.0, 1.0)  # cyan
+                    line_idx += 1
+
+        display_meta.num_rects = rect_idx
+        display_meta.num_lines = line_idx
+        pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+    # ── Run ─────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Start pipeline and block until error or EOS."""
+        if self.pipeline is None:
+            self.build()
+
+        self.loop = GLib.MainLoop()
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+
+        logger.info("Starting pipeline...")
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            logger.error("Failed to start pipeline")
+            return
+
+        try:
+            self.loop.run()
+        except KeyboardInterrupt:
+            logger.info("Interrupted")
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        """Clean shutdown."""
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+        for f in self.jsonl_files.values():
+            f.close()
+        logger.info("Pipeline stopped.")
+
+    def _on_bus_message(self, bus, message) -> None:
+        msg_type = message.type
+        if msg_type == Gst.MessageType.EOS:
+            logger.info("End of stream")
+            self.loop.quit()
+        elif msg_type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            logger.error("Pipeline error: %s\n%s", err, debug)
+            self.loop.quit()
+        elif msg_type == Gst.MessageType.WARNING:
+            err, debug = message.parse_warning()
+            logger.warning("Pipeline warning: %s\n%s", err, debug)
+
+
+# ── CLI entry point ────────────────────────────────────────────────────────
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="BPA Vision DeepStream Pipeline")
+    parser.add_argument(
+        "--sources",
+        nargs="+",
+        required=True,
+        help="RTSP URIs for camera sources",
+    )
+    parser.add_argument(
+        "--pose-config",
+        default="/app/deepstream/config_infer_yolo26m_pose.yml",
+        help="Path to nvinfer pose config",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="/app/output",
+        help="Directory for output files",
+    )
+    parser.add_argument(
+        "--conf-threshold",
+        type=float,
+        default=0.25,
+        help="Detection confidence threshold",
+    )
+    args = parser.parse_args()
+
+    sources = []
+    for idx, uri in enumerate(args.sources):
+        sources.append({
+            "camera_id": f"cam_{idx}",
+            "stream_uri": uri,
+        })
+
+    mgr = PipelineManager(
+        sources=sources,
+        pose_config=args.pose_config,
+        output_dir=args.output_dir,
+        conf_threshold=args.conf_threshold,
+    )
+    mgr.build()
+    mgr.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+property:
+  gpu-id: 0
+  net-scale-factor: 0.00392156862745098  # 1/255
+  onnx-file: /app/models/yolo26m-pose.onnx
+  model-engine-file: /app/models/yolo26m-pose.onnx_b1_gpu0_fp16.engine
+  batch-size: 1
+  process-mode: 1  # primary
+  model-color-format: 0  # RGB
+  network-mode: 2  # FP16
+  num-detected-classes: 1
+  interval: 0
+  gie-unique-id: 2
+  network-input-order: 0  # NCHW
+  maintain-aspect-ratio: 1
+  symmetric-padding: 1
+  cluster-mode: 4  # no clustering — NMS built into model
+  infer-dims: 3;640;640
+  output-tensor-meta: 1
+  # Model outputs [1, 300, 57]: 6 bbox + 51 keypoints (17*3)
+  # Parsing handled by Python probe via output-tensor-meta

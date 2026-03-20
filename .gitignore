@@ -15,3 +15,11 @@ output/
 *.log
 .idea/
 .vscode/
+
+# Models (large binary files)
+models/*.onnx
+models/*.engine
+models/*.pt
+
+# Temp
+*.pt
