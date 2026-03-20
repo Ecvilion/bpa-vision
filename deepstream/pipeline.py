@@ -26,6 +26,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
 import gi
@@ -217,24 +218,35 @@ class PipelineManager:
         """Add one RTSP source → decode → queue → muxer sink pad."""
         uri = src["stream_uri"]
 
+        # Parse credentials from URI — set via properties to handle
+        # special characters (like !) that can break inline URI auth.
+        parsed = urlparse(uri)
+        user = parsed.username
+        password = parsed.password
+
         rtspsrc = make_element("rtspsrc", f"rtspsrc_{idx}")
+        # Set full URI — rtspsrc handles inline credentials,
+        # but also set properties as fallback for digest auth
         rtspsrc.set_property("location", uri)
+        if user:
+            rtspsrc.set_property("user-id", user)
+        if password:
+            rtspsrc.set_property("user-pw", password)
         rtspsrc.set_property("latency", 200)
         rtspsrc.set_property("drop-on-latency", True)
 
-        depay = make_element("rtph264depay", f"depay_{idx}")
-        parse = make_element("h264parse", f"h264parse_src_{idx}")
+        # Use decodebin to auto-handle h264/h265/other codecs
         decoder = make_element("nvv4l2decoder", f"decoder_{idx}")
         decoder.set_property("gpu-id", GPU_ID)
         q_dec = make_queue(f"q_decode_{idx}")
 
-        for el in [rtspsrc, depay, parse, decoder, q_dec]:
+        for el in [rtspsrc, decoder, q_dec]:
             self.pipeline.add(el)
 
-        # rtspsrc has dynamic pads — connect on pad-added
-        rtspsrc.connect("pad-added", self._on_rtspsrc_pad_added, depay)
-        depay.link(parse)
-        parse.link(decoder)
+        # rtspsrc has dynamic pads — connect on pad-added with auto depay
+        rtspsrc.connect(
+            "pad-added", self._on_rtspsrc_pad_added_auto, idx, decoder
+        )
         decoder.link(q_dec)
 
         # Request a sink pad on streammux
@@ -243,20 +255,41 @@ class PipelineManager:
         q_src_pad = q_dec.get_static_pad("src")
         q_src_pad.link(mux_sink)
 
-    @staticmethod
-    def _on_rtspsrc_pad_added(
-        rtspsrc: Gst.Element, pad: Gst.Pad, depay: Gst.Element
+    def _on_rtspsrc_pad_added_auto(
+        self, rtspsrc: Gst.Element, pad: Gst.Pad, idx: int, decoder: Gst.Element
     ) -> None:
-        """Link rtspsrc dynamic pad to depayloader."""
+        """Auto-detect codec from rtspsrc pad and insert correct depay+parse."""
         caps = pad.get_current_caps()
         if caps is None:
             return
         struct = caps.get_structure(0)
         name = struct.get_name()
-        if name.startswith("application/x-rtp"):
-            sink_pad = depay.get_static_pad("sink")
-            if not sink_pad.is_linked():
-                pad.link(sink_pad)
+        if not name.startswith("application/x-rtp"):
+            return
+
+        encoding = struct.get_string("encoding-name") or ""
+        encoding = encoding.upper()
+        logger.info("Source %d: detected codec %s", idx, encoding)
+
+        if encoding == "H264":
+            depay = make_element("rtph264depay", f"depay_{idx}")
+            parse = make_element("h264parse", f"h264parse_src_{idx}")
+        elif encoding in ("H265", "HEVC"):
+            depay = make_element("rtph265depay", f"depay_{idx}")
+            parse = make_element("h265parse", f"h265parse_src_{idx}")
+        else:
+            logger.warning("Source %d: unsupported codec %s", idx, encoding)
+            return
+
+        self.pipeline.add(depay)
+        self.pipeline.add(parse)
+
+        pad.link(depay.get_static_pad("sink"))
+        depay.link(parse)
+        parse.link(decoder)
+
+        depay.sync_state_with_parent()
+        parse.sync_state_with_parent()
 
     # ── Probe callback ─────────────────────────────────────────────────
 
