@@ -1,0 +1,95 @@
+site_id: "site-001"
+site_name: "Demo Store"
+
+cameras:
+  - camera_id: "cam-entrance"
+    stream_uri: "rtsp://192.168.1.100:554/stream1"
+    codec: "h264"
+    resolution: [1920, 1080]
+    fps: 25.0
+
+    sampling:
+      target_fps: 5.0
+      max_batch_size: 1
+
+    geometry:
+      enabled: false
+
+    tracking:
+      profile: "lite"
+      t_lost_seconds: 5.0
+      reactivation_enabled: true
+
+    zones:
+      - zone_id: "zone-checkout"
+        name: "Checkout Area"
+        zone_type: "polygon"
+        points:
+          - [0.1, 0.3]
+          - [0.6, 0.3]
+          - [0.6, 0.9]
+          - [0.1, 0.9]
+
+      - zone_id: "line-entrance"
+        name: "Entrance Line"
+        zone_type: "line"
+        points:
+          - [0.0, 0.5]
+          - [1.0, 0.5]
+
+    analytics:
+      rules:
+        - rule_id: "rule-dwell-checkout"
+          rule_type: "dwell"
+          zone_id: "zone-checkout"
+          params:
+            max_dwell_seconds: 120
+
+        - rule_id: "rule-entrance-count"
+          rule_type: "line_crossing"
+          zone_id: "line-entrance"
+          params:
+            direction: "in"
+
+  - camera_id: "cam-aisle-1"
+    stream_uri: "rtsp://192.168.1.101:554/stream1"
+    codec: "h265"
+    resolution: [1920, 1080]
+    fps: 25.0
+
+    sampling:
+      target_fps: 3.0
+
+    geometry:
+      enabled: true
+      distortion_correction: false
+      homography_points:
+        - [0.0, 0.0, 0.0, 0.0]
+        - [1.0, 0.0, 10.0, 0.0]
+        - [1.0, 1.0, 10.0, 8.0]
+        - [0.0, 1.0, 0.0, 8.0]
+
+    tracking:
+      profile: "strong"
+      t_lost_seconds: 10.0
+      reactivation_enabled: true
+
+    zones: []
+    analytics:
+      rules: []
+
+identity:
+  body_embedding_dim: 256
+  face_embedding_dim: 512
+  retrieve_threshold: 0.4
+  provisional_threshold: 0.6
+  confirm_threshold: 0.75
+  candidate_margin_min: 0.05
+  k_max_per_view: 3
+  face_confirm_threshold: 0.7
+
+retention:
+  tracks_days: 30
+  events_days: 90
+  crops_days: 14
+  embeddings_days: 90
