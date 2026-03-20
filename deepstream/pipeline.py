@@ -33,7 +33,7 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
-from gi.repository import GLib, Gst
+from gi.repository import GLib, Gst, GstRtspServer
 
 import pyds
 
@@ -90,12 +90,14 @@ class PipelineManager:
         pose_config: str,
         output_dir: str = "/app/output",
         conf_threshold: float = 0.25,
+        rtsp_out_port: int = 0,
     ):
         self.sources = sources
         self.pose_config = pose_config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.conf_threshold = conf_threshold
+        self.rtsp_out_port = rtsp_out_port  # 0 = disabled
 
         self.pipeline: Gst.Pipeline | None = None
         self.loop: GLib.MainLoop | None = None
@@ -189,14 +191,17 @@ class PipelineManager:
         encoder.link(h264parse)
         h264parse.link(splitmux)
 
-        # ── Branch 2: fakesink (keeps pipeline running if no file needed) ──
-        q_fake = make_queue("q_fake")
-        fakesink = make_element("fakesink", "fakesink")
-        fakesink.set_property("sync", 0)
-        self.pipeline.add(q_fake)
-        self.pipeline.add(fakesink)
-        tee.link(q_fake)
-        q_fake.link(fakesink)
+        # ── Branch 2: RTSP output server or fakesink ──
+        if self.rtsp_out_port > 0:
+            self._add_rtsp_server_branch(tee)
+        else:
+            q_fake = make_queue("q_fake")
+            fakesink = make_element("fakesink", "fakesink")
+            fakesink.set_property("sync", 0)
+            self.pipeline.add(q_fake)
+            self.pipeline.add(fakesink)
+            tee.link(q_fake)
+            q_fake.link(fakesink)
 
         # ── Probe on nvinfer src pad to parse tensors + draw OSD ──
         infer_src_pad = nvinfer.get_static_pad("src")
@@ -485,6 +490,82 @@ class PipelineManager:
         display_meta.num_lines = line_idx
         pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
+    # ── RTSP output server ────────────────────────────────────────────
+
+    def _add_rtsp_server_branch(self, tee: Gst.Element) -> None:
+        """Add tee branch that encodes and feeds an RTSP server.
+
+        Viewers connect to: rtsp://<host>:<port>/bpa-vision
+        """
+        q_rtsp = make_queue("q_rtsp_out")
+        nvvidconv_rtsp = make_element("nvvideoconvert", "nvvidconv_rtsp")
+        nvvidconv_rtsp.set_property("gpu-id", GPU_ID)
+
+        caps_rtsp = make_element("capsfilter", "caps_rtsp")
+        caps_rtsp.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
+        )
+
+        encoder_rtsp = make_element("nvv4l2h264enc", "encoder_rtsp")
+        encoder_rtsp.set_property("bitrate", 4000000)
+        encoder_rtsp.set_property("iframeinterval", 30)
+        encoder_rtsp.set_property("profile", 4)  # high
+
+        h264parse_rtsp = make_element("h264parse", "h264parse_rtsp")
+
+        rtppay = make_element("rtph264pay", "rtppay")
+        rtppay.set_property("pt", 96)
+
+        # udpsink sending to localhost — RTSP server will pick it up
+        updsink_port = 5400
+        udpsink = make_element("udpsink", "udpsink_rtsp")
+        udpsink.set_property("host", "127.0.0.1")
+        udpsink.set_property("port", updsink_port)
+        udpsink.set_property("sync", 0)
+        udpsink.set_property("async", 0)
+
+        for el in [
+            q_rtsp, nvvidconv_rtsp, caps_rtsp,
+            encoder_rtsp, h264parse_rtsp, rtppay, udpsink,
+        ]:
+            self.pipeline.add(el)
+
+        tee.link(q_rtsp)
+        q_rtsp.link(nvvidconv_rtsp)
+        nvvidconv_rtsp.link(caps_rtsp)
+        caps_rtsp.link(encoder_rtsp)
+        encoder_rtsp.link(h264parse_rtsp)
+        h264parse_rtsp.link(rtppay)
+        rtppay.link(udpsink)
+
+        # Store port for RTSP server setup
+        self._udpsink_port = updsink_port
+
+    def _start_rtsp_server(self) -> None:
+        """Start GstRtspServer that serves the encoded stream."""
+        if self.rtsp_out_port <= 0:
+            return
+
+        server = GstRtspServer.RTSPServer.new()
+        server.set_service(str(self.rtsp_out_port))
+
+        factory = GstRtspServer.RTSPMediaFactory.new()
+        factory.set_launch(
+            f'( udpsrc port={self._udpsink_port} '
+            f'caps="application/x-rtp,media=video,encoding-name=H264,payload=96" '
+            f'! rtph264depay ! h264parse ! rtph264pay name=pay0 pt=96 )'
+        )
+        factory.set_shared(True)
+
+        mounts = server.get_mount_points()
+        mounts.add_factory("/bpa-vision", factory)
+        server.attach(None)
+
+        logger.info(
+            "RTSP output server started at rtsp://localhost:%d/bpa-vision",
+            self.rtsp_out_port,
+        )
+
     # ── Run ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -493,6 +574,9 @@ class PipelineManager:
             self.build()
 
         self.loop = GLib.MainLoop()
+
+        # Start RTSP output server if enabled
+        self._start_rtsp_server()
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -568,6 +652,12 @@ def main():
         default=0.25,
         help="Detection confidence threshold",
     )
+    parser.add_argument(
+        "--rtsp-out-port",
+        type=int,
+        default=0,
+        help="RTSP output server port (0 = disabled). View at rtsp://host:<port>/bpa-vision",
+    )
     args = parser.parse_args()
 
     if args.sources_file:
@@ -586,6 +676,7 @@ def main():
         pose_config=args.pose_config,
         output_dir=args.output_dir,
         conf_threshold=args.conf_threshold,
+        rtsp_out_port=args.rtsp_out_port,
     )
     mgr.build()
     mgr.run()

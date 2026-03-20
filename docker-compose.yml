@@ -26,3 +26,4 @@ services:
         --pose-config /app/deepstream/config_infer_yolo26m_pose.yml
         --output-dir /app/output
         --conf-threshold 0.25
+        --rtsp-out-port 8554
