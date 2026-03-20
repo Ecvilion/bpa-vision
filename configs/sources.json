@@ -1,0 +1,4 @@
+[
+  {"camera_id": "cam-01", "stream_uri": "rtsp://viewer:Pass4Camera!@192.168.50.245"},
+  {"camera_id": "cam-02", "stream_uri": "rtsp://viewer:Pass4Camera!@192.168.50.243"}
+]

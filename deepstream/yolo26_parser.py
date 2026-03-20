@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import ctypes
+
 import numpy as np
 import pyds
 
@@ -48,28 +50,44 @@ class PoseDetection(Detection):
     keypoints: list[tuple[float, float, float]] = field(default_factory=list)
 
 
-def _get_tensor_output(tensor_meta) -> np.ndarray | None:
-    """Extract numpy array from NvDsInferTensorMeta output layer."""
-    layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
+def _get_tensor_output(
+    tensor_meta, layer_index: int = 0, expected_cols: int = 0
+) -> np.ndarray | None:
+    """Extract numpy array from NvDsInferTensorMeta output layer.
+
+    Uses ctypes to read the float buffer directly from the layer.
+    """
+    layer = pyds.get_nvds_LayerInfo(tensor_meta, layer_index)
     if layer is None:
         return None
 
     dims = layer.inferDims
-    # Build shape from dims
     num_dims = dims.numDims
     shape = [dims.d[i] for i in range(num_dims)]
 
-    ptr = pyds.get_ptr(layer.buffer)
-    if ptr is None:
-        return None
-
-    # Total elements
     total = 1
     for s in shape:
         total *= s
 
-    arr = np.ctypeslib.as_array(ptr, shape=(total,))
-    return arr.reshape(shape).copy()
+    if total <= 0:
+        return None
+
+    # Get buffer pointer via pyds and read as ctypes float array
+    ptr = pyds.get_ptr(layer.buffer)
+    if ptr is None:
+        return None
+
+    # Cast pointer to float array of correct size
+    float_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_float * total))
+    arr = np.frombuffer(float_ptr.contents, dtype=np.float32).copy()
+
+    if len(shape) > 1 and all(s > 0 for s in shape):
+        return arr.reshape(shape)
+
+    if expected_cols > 0 and arr.size % expected_cols == 0:
+        return arr.reshape(-1, expected_cols)
+
+    return arr
 
 
 def parse_detection_tensor(
@@ -84,7 +102,7 @@ def parse_detection_tensor(
 
     Coordinates are returned in pixel space of the original frame.
     """
-    arr = _get_tensor_output(tensor_meta)
+    arr = _get_tensor_output(tensor_meta, expected_cols=6)
     if arr is None:
         return []
 
@@ -133,12 +151,19 @@ def parse_pose_tensor(
     Each row: [x1, y1, x2, y2, conf, class_id, kp0_x, kp0_y, kp0_conf, ...]
     Coordinates are returned in pixel space of the original frame.
     """
-    arr = _get_tensor_output(tensor_meta)
+    arr = _get_tensor_output(tensor_meta, expected_cols=57)
     if arr is None:
         return []
 
     if arr.ndim == 3:
         arr = arr[0]
+
+    # Ensure 2D
+    if arr.ndim == 1 and arr.size >= 57:
+        arr = arr.reshape(-1, 57)
+
+    if arr.ndim != 2 or arr.shape[1] < 57:
+        return []
 
     detections = []
     scale_x = frame_width / input_width

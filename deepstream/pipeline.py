@@ -26,7 +26,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 from uuid import uuid4
 
 import gi
@@ -53,6 +53,8 @@ MUXER_BATCH_TIMEOUT = 40000  # μs
 GPU_ID = 0
 
 # COCO skeleton for OSD drawing (pairs of keypoint indices)
+MAX_OSD_ELEMENTS = 16  # pyds.MAX_ELEMENTS_IN_DISPLAY_META
+
 SKELETON_PAIRS = [
     (0, 1), (0, 2), (1, 3), (2, 4),  # head
     (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # arms
@@ -218,22 +220,23 @@ class PipelineManager:
         """Add one RTSP source → decode → queue → muxer sink pad."""
         uri = src["stream_uri"]
 
-        # Parse credentials from URI — set via properties to handle
-        # special characters (like !) that can break inline URI auth.
+        # GStreamer rtspsrc does NOT url-decode passwords in inline URIs,
+        # so special characters (like !) must be percent-encoded.
         parsed = urlparse(uri)
-        user = parsed.username
-        password = parsed.password
+        if parsed.username and parsed.password:
+            encoded_user = quote(parsed.username, safe="")
+            encoded_pass = quote(parsed.password, safe="")
+            netloc = f"{encoded_user}:{encoded_pass}@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            uri = urlunparse(parsed._replace(netloc=netloc))
 
         rtspsrc = make_element("rtspsrc", f"rtspsrc_{idx}")
-        # Set full URI — rtspsrc handles inline credentials,
-        # but also set properties as fallback for digest auth
         rtspsrc.set_property("location", uri)
-        if user:
-            rtspsrc.set_property("user-id", user)
-        if password:
-            rtspsrc.set_property("user-pw", password)
         rtspsrc.set_property("latency", 200)
         rtspsrc.set_property("drop-on-latency", True)
+        # Force TCP to avoid UDP firewall issues
+        rtspsrc.set_property("protocols", 4)  # GST_RTSP_LOWER_TRANS_TCP
 
         # Use decodebin to auto-handle h264/h265/other codecs
         decoder = make_element("nvv4l2decoder", f"decoder_{idx}")
@@ -267,6 +270,11 @@ class PipelineManager:
         if not name.startswith("application/x-rtp"):
             return
 
+        # Check media type — ignore audio streams
+        media = struct.get_string("media") or ""
+        if media != "video":
+            return
+
         encoding = struct.get_string("encoding-name") or ""
         encoding = encoding.upper()
         logger.info("Source %d: detected codec %s", idx, encoding)
@@ -278,7 +286,7 @@ class PipelineManager:
             depay = make_element("rtph265depay", f"depay_{idx}")
             parse = make_element("h265parse", f"h265parse_src_{idx}")
         else:
-            logger.warning("Source %d: unsupported codec %s", idx, encoding)
+            logger.warning("Source %d: unsupported video codec %s", idx, encoding)
             return
 
         self.pipeline.add(depay)
@@ -377,14 +385,35 @@ class PipelineManager:
                 tensor_meta = pyds.NvDsInferTensorMeta.cast(
                     user_meta.user_meta_data
                 )
-                detections = parse_pose_tensor(
-                    tensor_meta,
-                    conf_threshold=self.conf_threshold,
-                    input_width=640,
-                    input_height=640,
-                    frame_width=MUXER_WIDTH,
-                    frame_height=MUXER_HEIGHT,
-                )
+
+                # Log tensor info once for debugging
+                if not hasattr(self, "_tensor_logged"):
+                    self._tensor_logged = True
+                    num_layers = tensor_meta.num_output_layers
+                    logger.info("Tensor meta: %d output layers", num_layers)
+                    for li in range(num_layers):
+                        layer = pyds.get_nvds_LayerInfo(tensor_meta, li)
+                        if layer:
+                            dims = layer.inferDims
+                            shape = [dims.d[i] for i in range(dims.numDims)]
+                            logger.info(
+                                "  Layer %d: name=%s, dims=%s, dataType=%s",
+                                li, layer.layerName, shape, layer.dataType,
+                            )
+
+                try:
+                    detections = parse_pose_tensor(
+                        tensor_meta,
+                        conf_threshold=self.conf_threshold,
+                        input_width=640,
+                        input_height=640,
+                        frame_width=MUXER_WIDTH,
+                        frame_height=MUXER_HEIGHT,
+                    )
+                except Exception as e:
+                    if not hasattr(self, "_parse_error_logged"):
+                        self._parse_error_logged = True
+                        logger.error("Tensor parse error: %s", e)
                 break
 
             try:
@@ -407,7 +436,7 @@ class PipelineManager:
 
         for det in detections:
             # Draw bounding box
-            if rect_idx < display_meta.MAX_ELEMENTS_IN_DISPLAY_META:
+            if rect_idx < MAX_OSD_ELEMENTS:
                 rect = pyds.NvOSD_RectParams.cast(
                     display_meta.rect_params[rect_idx]
                 )
@@ -428,7 +457,7 @@ class PipelineManager:
                     # Only draw if both keypoints are confident
                     if kp_i[2] < 0.3 or kp_j[2] < 0.3:
                         continue
-                    if line_idx >= display_meta.MAX_ELEMENTS_IN_DISPLAY_META:
+                    if line_idx >= MAX_OSD_ELEMENTS:
                         # Need a new display meta
                         display_meta.num_rects = rect_idx
                         display_meta.num_lines = line_idx
@@ -513,11 +542,15 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="BPA Vision DeepStream Pipeline")
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
         "--sources",
         nargs="+",
-        required=True,
         help="RTSP URIs for camera sources",
+    )
+    group.add_argument(
+        "--sources-file",
+        help="JSON file with camera sources: [{camera_id, stream_uri}, ...]",
     )
     parser.add_argument(
         "--pose-config",
@@ -537,12 +570,16 @@ def main():
     )
     args = parser.parse_args()
 
-    sources = []
-    for idx, uri in enumerate(args.sources):
-        sources.append({
-            "camera_id": f"cam_{idx}",
-            "stream_uri": uri,
-        })
+    if args.sources_file:
+        with open(args.sources_file, "r", encoding="utf-8") as f:
+            sources = json.load(f)
+    else:
+        sources = []
+        for idx, uri in enumerate(args.sources):
+            sources.append({
+                "camera_id": f"cam_{idx}",
+                "stream_uri": uri,
+            })
 
     mgr = PipelineManager(
         sources=sources,
