@@ -6,6 +6,7 @@ uses local geometry module instead of vision_box imports.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from typing import Iterable
 
@@ -13,6 +14,22 @@ import cv2  # type: ignore
 import numpy as np
 
 from .geometry import apply_homography, validate_homography_matrix
+
+
+@dataclass(frozen=True)
+class HomographyResult:
+    """Computed homography with diagnostics for UI and persistence."""
+    matrix: list[list[float]]
+    reprojection_error: float
+    inliers: int
+    estimator: str
+    reprojected_points: list[tuple[float, float]]
+    inlier_mask: list[bool]
+    inlier_reprojection_error: float
+    median_reprojection_error: float
+    max_reprojection_error: float
+    source_coverage: float
+    destination_coverage: float
 
 
 def _to_point_array(points: Iterable[tuple[float, float] | list[float]]) -> np.ndarray:
@@ -39,22 +56,43 @@ def compute_homography(
     Returns:
         (matrix_3x3_as_nested_lists, mean_reprojection_error_px)
     """
-    matrix, reprojection_error, _inliers, _estimator = _compute_homography_impl(
-        src_points, dst_points
-    )
-    return matrix, reprojection_error
+    result = _compute_homography_impl(src_points, dst_points)
+    return result.matrix, result.reprojection_error
+
+
+def _coverage_ratio(points: np.ndarray) -> float:
+    """Estimate how well points cover their bounding box.
+
+    0.0 means degenerate / highly clustered. 1.0 means points span the full box.
+    """
+    if points.shape[0] < 3:
+        return 0.0
+    x_min = float(points[:, 0].min())
+    x_max = float(points[:, 0].max())
+    y_min = float(points[:, 1].min())
+    y_max = float(points[:, 1].max())
+    bbox_area = max(0.0, (x_max - x_min) * (y_max - y_min))
+    if bbox_area <= 0.0:
+        return 0.0
+    hull = cv2.convexHull(points.astype(np.float32))
+    hull_area = float(cv2.contourArea(hull))
+    return max(0.0, min(1.0, hull_area / bbox_area))
 
 
 def _compute_homography_impl(
     src_points: list[tuple[float, float]] | list[list[float]],
     dst_points: list[tuple[float, float]] | list[list[float]],
-) -> tuple[list[list[float]], float, int, str]:
+) -> HomographyResult:
     src = _to_point_array(src_points)
     dst = _to_point_array(dst_points)
     if src.shape[0] != dst.shape[0]:
         raise ValueError("src_points and dst_points must have equal length")
     if src.shape[0] < 4:
         raise ValueError("At least 4 point pairs are required")
+    if np.unique(src, axis=0).shape[0] < 4:
+        raise ValueError("At least 4 unique source points are required")
+    if np.unique(dst, axis=0).shape[0] < 4:
+        raise ValueError("At least 4 unique destination points are required")
 
     h_matrix = None
     inlier_mask = None
@@ -111,7 +149,31 @@ def _compute_homography_impl(
         dy = py - float(dst[idx][1])
         errors.append(math.sqrt(dx * dx + dy * dy))
     reprojection_error = float(sum(errors) / len(errors)) if errors else 0.0
-    return matrix, reprojection_error, inliers, estimator
+
+    mask_values = (
+        np.asarray(inlier_mask, dtype=np.int32).reshape(-1).astype(bool).tolist()
+        if inlier_mask is not None
+        else [True] * len(projected)
+    )
+    inlier_errors = [err for err, ok in zip(errors, mask_values) if ok]
+
+    return HomographyResult(
+        matrix=matrix,
+        reprojection_error=reprojection_error,
+        inliers=inliers,
+        estimator=estimator,
+        reprojected_points=projected,
+        inlier_mask=mask_values,
+        inlier_reprojection_error=(
+            float(sum(inlier_errors) / len(inlier_errors)) if inlier_errors else 0.0
+        ),
+        median_reprojection_error=(
+            float(np.median(np.asarray(errors, dtype=np.float64))) if errors else 0.0
+        ),
+        max_reprojection_error=max(errors) if errors else 0.0,
+        source_coverage=_coverage_ratio(src),
+        destination_coverage=_coverage_ratio(dst),
+    )
 
 
 def reproject_points(

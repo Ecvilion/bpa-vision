@@ -59,7 +59,7 @@
     }
     .grid {
       display:grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr;
       gap:12px;
       padding:12px;
     }
@@ -149,7 +149,7 @@
 <body>
   <header>
     <strong>Calibration + Camera Config Tool</strong>
-    <span style="color:var(--muted);font-size:12px;">Left: camera frame. Right: floor plan. Click paired points in same order. If you calibrate distortion from a chessboard, use "Capture Undistorted" before placing homography points. Camera/site settings are editable below as JSON.</span>
+    <span style="color:var(--muted);font-size:12px;">Top: camera frame. Bottom: floor plan. Click paired points in same order. If you calibrate distortion from a chessboard, use "Capture Undistorted" before placing homography points. Camera/site settings are editable below as JSON.</span>
   </header>
 
   <div class="toolbar">
@@ -246,14 +246,19 @@
       cameras: [],
       cameraMetaById: {},
       floorPlans: [],
-      cameraPoints: [],
-      planPoints: [],
+      pointPairs: [],
       coveragePolygon: [],
       coverageMode: false,
       reprojected: [],
       matrix: null,
       reprojError: null,
+      inlierReprojError: null,
+      medianReprojError: null,
+      maxReprojError: null,
+      sourceCoverage: null,
+      destinationCoverage: null,
       inliers: 0,
+      inlierMask: [],
       drag: { target: null, idx: -1 },
       hoverGuides: {
         camera: null,
@@ -322,6 +327,97 @@
       els.coverageModeBtn.className = state.coverageMode ? 'warn' : '';
     }
 
+    function clonePoint(point) {
+      if (!point) return null;
+      return { x: Number(point.x), y: Number(point.y) };
+    }
+
+    function loadPointPairs(rawPairs) {
+      state.pointPairs = Array.isArray(rawPairs)
+        ? rawPairs.map((pair) => ({
+          camera: (pair && Array.isArray(pair.camera_point) && pair.camera_point.length === 2)
+            ? { x: Number(pair.camera_point[0]), y: Number(pair.camera_point[1]) }
+            : null,
+          plan: (pair && Array.isArray(pair.plan_point) && pair.plan_point.length === 2)
+            ? { x: Number(pair.plan_point[0]), y: Number(pair.plan_point[1]) }
+            : null,
+        }))
+        : [];
+    }
+
+    function serializePointPairs() {
+      return state.pointPairs.map((pair) => ({
+        camera_point: pair.camera ? [Number(pair.camera.x), Number(pair.camera.y)] : null,
+        plan_point: pair.plan ? [Number(pair.plan.x), Number(pair.plan.y)] : null,
+      }));
+    }
+
+    function completePairs() {
+      return state.pointPairs.filter((pair) => pair.camera && pair.plan);
+    }
+
+    function pointCount(side) {
+      return state.pointPairs.reduce((count, pair) => count + (pair[side] ? 1 : 0), 0);
+    }
+
+    function incompletePairCount() {
+      return state.pointPairs.reduce(
+        (count, pair) => count + ((pair.camera && pair.plan) ? 0 : 1),
+        0,
+      );
+    }
+
+    function resetComputedHomography() {
+      state.matrix = null;
+      state.reprojected = [];
+      state.reprojError = null;
+      state.inlierReprojError = null;
+      state.medianReprojError = null;
+      state.maxReprojError = null;
+      state.sourceCoverage = null;
+      state.destinationCoverage = null;
+      state.inliers = 0;
+      state.inlierMask = [];
+    }
+
+    function syncCalibrationStateIntoEditor({ includeCoverage = true, includeHomography = false } = {}) {
+      const cfg = currentCameraConfig(false);
+      if (!cfg) return;
+      cfg.point_pairs = serializePointPairs();
+      if (includeCoverage) {
+        cfg.coverage_polygon = state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]);
+        cfg.floor_plan_filename = String(els.planSelect.value || cfg.floor_plan_filename || '');
+      }
+      if (includeHomography) {
+        cfg.matrix = state.matrix || cfg.matrix || null;
+        cfg.matrix_ground = state.matrix || cfg.matrix_ground || cfg.matrix || null;
+        cfg.homography_stats = {
+          reprojection_error: state.reprojError,
+          inlier_reprojection_error: state.inlierReprojError,
+          median_reprojection_error: state.medianReprojError,
+          max_reprojection_error: state.maxReprojError,
+          source_coverage: state.sourceCoverage,
+          destination_coverage: state.destinationCoverage,
+          inliers: state.inliers,
+          total_pairs: completePairs().length,
+        };
+      }
+      setCameraConfig(cfg);
+    }
+
+    function addPointForSide(side, point) {
+      const pair = state.pointPairs.find((item) => !item[side]);
+      const normalized = { x: Number(point.x), y: Number(point.y) };
+      if (pair) {
+        pair[side] = normalized;
+        return state.pointPairs.indexOf(pair);
+      }
+      const next = { camera: null, plan: null };
+      next[side] = normalized;
+      state.pointPairs.push(next);
+      return state.pointPairs.length - 1;
+    }
+
     function parseJsonArea(area, label, strict = true) {
       const raw = String(area.value || '').trim();
       if (!raw) {
@@ -364,6 +460,41 @@
     function setSiteConfig(obj) {
       els.siteConfigEditor.value = formatJson(obj);
       updateButtons();
+    }
+
+    function syncStateFromCameraEditor() {
+      const cfg = currentCameraConfig(false);
+      if (!cfg) return;
+      if (Array.isArray(cfg.point_pairs)) {
+        loadPointPairs(cfg.point_pairs);
+      }
+      if (Array.isArray(cfg.coverage_polygon)) {
+        state.coveragePolygon = cfg.coverage_polygon.map((point) => ({
+          x: Number(point[0]),
+          y: Number(point[1]),
+        }));
+      }
+      if (cfg.homography_stats && typeof cfg.homography_stats === 'object') {
+        const stats = cfg.homography_stats;
+        state.reprojError = Number(stats.reprojection_error ?? 0) || null;
+        state.inlierReprojError = Number(stats.inlier_reprojection_error ?? 0) || null;
+        state.medianReprojError = Number(stats.median_reprojection_error ?? 0) || null;
+        state.maxReprojError = Number(stats.max_reprojection_error ?? 0) || null;
+        state.sourceCoverage = Number(stats.source_coverage ?? 0) || null;
+        state.destinationCoverage = Number(stats.destination_coverage ?? 0) || null;
+        state.inliers = Number(stats.inliers ?? 0) || 0;
+        state.inlierMask = Array.isArray(stats.inlier_mask) ? stats.inlier_mask.map((value) => Boolean(value)) : [];
+      } else {
+        state.reprojError = null;
+        state.inlierReprojError = null;
+        state.medianReprojError = null;
+        state.maxReprojError = null;
+        state.sourceCoverage = null;
+        state.destinationCoverage = null;
+        state.inliers = 0;
+        state.inlierMask = [];
+      }
+      state.matrix = cfg.matrix_ground || cfg.matrix || null;
     }
 
     function buildCaptureFilename(prefix, index, blobType = '') {
@@ -443,6 +574,8 @@
         distortion_coefficients: null,
         distortion_correction_mode: 'point',
         coverage_polygon: [],
+        point_pairs: [],
+        homography_stats: null,
       };
     }
 
@@ -462,6 +595,8 @@
         distortion_coefficients: meta.distortion_coefficients || null,
         distortion_correction_mode: String(meta.distortion_correction_mode || 'point'),
         coverage_polygon: (meta.coverage_polygon || []).map((point) => [Number(point[0]), Number(point[1])]),
+        point_pairs: meta.point_pairs || [],
+        homography_stats: meta.homography_stats || null,
       };
     }
 
@@ -478,11 +613,7 @@
     }
 
     function syncCoverageIntoEditor() {
-      const cfg = currentCameraConfig(false);
-      if (!cfg) return;
-      cfg.coverage_polygon = state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]);
-      cfg.floor_plan_filename = String(els.planSelect.value || cfg.floor_plan_filename || '');
-      setCameraConfig(cfg);
+      syncCalibrationStateIntoEditor({ includeCoverage: true, includeHomography: false });
     }
 
     function updateStageMeta() {
@@ -491,18 +622,35 @@
       const cameraSize = (els.cameraImg.naturalWidth && els.cameraImg.naturalHeight)
         ? `${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight}`
         : 'no frame';
-      els.cameraStageMeta.textContent = `${cameraId || 'unsaved camera'} | ${cameraSize}`;
+      els.cameraStageMeta.textContent = [
+        cameraId || 'unsaved camera',
+        cameraSize,
+        `points=${pointCount('camera')}`,
+        `pairs=${completePairs().length}/${state.pointPairs.length}`,
+      ].join(' | ');
       const planName = String(els.planSelect.value || cfg?.floor_plan_filename || '');
       const planSize = (els.planImg.naturalWidth && els.planImg.naturalHeight)
         ? `${els.planImg.naturalWidth}x${els.planImg.naturalHeight}`
         : 'no plan';
-      els.planStageMeta.textContent = `${planName || 'no floor plan'} | ${planSize}`;
+      const statsBits = [];
+      if (state.reprojError != null) {
+        statsBits.push(`err=${Number(state.reprojError).toFixed(3)}`);
+      }
+      if (state.inliers) {
+        statsBits.push(`inliers=${state.inliers}/${completePairs().length}`);
+      }
+      els.planStageMeta.textContent = [
+        planName || 'no floor plan',
+        planSize,
+        `points=${pointCount('plan')}`,
+        ...statsBits,
+      ].join(' | ');
     }
 
     function updateButtons() {
-      const pairCount = Math.min(state.cameraPoints.length, state.planPoints.length);
-      const balanced = state.cameraPoints.length === state.planPoints.length;
-      els.computeBtn.disabled = !(pairCount >= 4 && balanced);
+      const pairCount = completePairs().length;
+      const noIncompletePairs = incompletePairCount() === 0;
+      els.computeBtn.disabled = !(pairCount >= 4 && noIncompletePairs);
       const cfg = currentCameraConfig(false);
       els.saveBtn.disabled = !(cfg && String(cfg.camera_id || '').trim() && String(els.planSelect.value || '').trim());
       els.saveSiteBtn.disabled = !(currentSiteConfig(false));
@@ -539,9 +687,10 @@
       return { x: point.x * sx, y: point.y * sy };
     }
 
-    function drawPoints(canvas, img, points, color, reprojected = [], polygon = [], guides = null) {
+    function drawPoints(canvas, img, points, side, color, reprojected = [], polygon = [], guides = null) {
       fitCanvas(img, canvas);
       const ctx = canvas.getContext('2d');
+      const completed = completePairs();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (guides) {
         const guidePoint = toScreenCoords(guides, img, canvas);
@@ -585,29 +734,50 @@
       }
       ctx.lineWidth = 2;
       ctx.font = '12px ui-monospace, monospace';
-      points.forEach((point, idx) => {
+      state.pointPairs.forEach((pair, idx) => {
+        const point = points[idx];
+        if (!point) return;
         const p = toScreenCoords(point, img, canvas);
-        ctx.strokeStyle = color;
-        ctx.fillStyle = color;
+        const isComplete = Boolean(pair.camera && pair.plan);
+        const maskIdx = isComplete ? completed.findIndex((item) => item === pair) : -1;
+        const reprojectedPoint = maskIdx >= 0 ? reprojected[maskIdx] : null;
+        let stroke = color;
+        if (maskIdx >= 0 && state.inlierMask.length) {
+          stroke = state.inlierMask[maskIdx] ? '#63d9be' : '#ff7777';
+        } else if (!isComplete) {
+          stroke = '#ffcc66';
+        }
+
+        if (side === 'plan' && reprojectedPoint) {
+          const rp = toScreenCoords(reprojectedPoint, img, canvas);
+          ctx.strokeStyle = 'rgba(77, 183, 255, 0.7)';
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y);
+          ctx.lineTo(rp.x, rp.y);
+          ctx.stroke();
+          ctx.strokeStyle = '#4db7ff';
+          ctx.beginPath();
+          ctx.arc(rp.x, rp.y, 5, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        ctx.strokeStyle = stroke;
+        ctx.fillStyle = stroke;
         ctx.beginPath();
         ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
         ctx.stroke();
         ctx.fillText(String(idx + 1), p.x + 8, p.y - 8);
       });
-      reprojected.forEach((point) => {
-        const p = toScreenCoords(point, img, canvas);
-        ctx.strokeStyle = '#4db7ff';
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-        ctx.stroke();
-      });
     }
 
     function redraw() {
+      const cameraPoints = state.pointPairs.map((pair) => clonePoint(pair.camera));
+      const planPoints = state.pointPairs.map((pair) => clonePoint(pair.plan));
       drawPoints(
         els.cameraCanvas,
         els.cameraImg,
-        state.cameraPoints,
+        cameraPoints,
+        'camera',
         '#ffd166',
         [],
         [],
@@ -616,7 +786,8 @@
       drawPoints(
         els.planCanvas,
         els.planImg,
-        state.planPoints,
+        planPoints,
+        'plan',
         '#63d9be',
         state.reprojected,
         state.coveragePolygon,
@@ -625,14 +796,17 @@
       updateButtons();
     }
 
-    function nearestPointIdx(points, img, canvas, evt) {
-      if (!points.length) return -1;
+    function nearestPointIdx(target, img, canvas, evt) {
       const rect = canvas.getBoundingClientRect();
       const mx = evt.clientX - rect.left;
       const my = evt.clientY - rect.top;
       let best = -1;
       let bestDist = 1e9;
+      const points = Array.isArray(target)
+        ? target
+        : state.pointPairs.map((pair) => pair[target]);
       points.forEach((point, idx) => {
+        if (!point) return;
         const p = toScreenCoords(point, img, canvas);
         const dx = p.x - mx;
         const dy = p.y - my;
@@ -645,35 +819,49 @@
       return bestDist <= 14 ? best : -1;
     }
 
-    function wireCanvas(canvas, img, key) {
-      const guideKey = key === 'planPoints' ? 'plan' : null;
+    function wireCanvas(canvas, img, side) {
+      const guideKey = side === 'plan' ? 'plan' : null;
       canvas.addEventListener('click', (evt) => {
         if (state.drag.target) return;
         const point = toImageCoords(evt, img, canvas);
-        const targetKey = (key === 'planPoints' && state.coverageMode) ? 'coveragePolygon' : key;
-        state[targetKey].push({ x: point.x, y: point.y });
-        state.matrix = null;
-        state.reprojected = [];
-        if (targetKey === 'coveragePolygon') syncCoverageIntoEditor();
-        setStatus(`point #${state[targetKey].length} added on ${targetKey}`, 'warn');
+        const targetKey = (side === 'plan' && state.coverageMode) ? 'coveragePolygon' : side;
+        if (targetKey === 'coveragePolygon') {
+          state.coveragePolygon.push({ x: point.x, y: point.y });
+          syncCoverageIntoEditor();
+          setStatus(`coverage point #${state.coveragePolygon.length} added`, 'warn');
+        } else {
+          const pairIdx = addPointForSide(targetKey, point);
+          resetComputedHomography();
+          syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
+          setStatus(`pair #${pairIdx + 1} updated on ${targetKey}`, 'warn');
+        }
         redraw();
       });
       canvas.addEventListener('contextmenu', (evt) => {
         evt.preventDefault();
-        const targetKey = (key === 'planPoints' && state.coverageMode) ? 'coveragePolygon' : key;
-        const idx = nearestPointIdx(state[targetKey], img, canvas, evt);
+        const targetKey = (side === 'plan' && state.coverageMode) ? 'coveragePolygon' : side;
+        const idx = (targetKey === 'coveragePolygon')
+          ? nearestPointIdx(state.coveragePolygon, img, canvas, evt)
+          : nearestPointIdx(targetKey, img, canvas, evt);
         if (idx >= 0) {
-          state[targetKey].splice(idx, 1);
-          state.matrix = null;
-          state.reprojected = [];
-          if (targetKey === 'coveragePolygon') syncCoverageIntoEditor();
-          setStatus(`point #${idx + 1} removed`, 'warn');
+          if (targetKey === 'coveragePolygon') {
+            state.coveragePolygon.splice(idx, 1);
+            syncCoverageIntoEditor();
+            setStatus(`coverage point #${idx + 1} removed`, 'warn');
+          } else {
+            state.pointPairs.splice(idx, 1);
+            resetComputedHomography();
+            syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
+            setStatus(`pair #${idx + 1} removed`, 'warn');
+          }
           redraw();
         }
       });
       canvas.addEventListener('mousedown', (evt) => {
-        const targetKey = (key === 'planPoints' && state.coverageMode) ? 'coveragePolygon' : key;
-        const idx = nearestPointIdx(state[targetKey], img, canvas, evt);
+        const targetKey = (side === 'plan' && state.coverageMode) ? 'coveragePolygon' : side;
+        const idx = (targetKey === 'coveragePolygon')
+          ? nearestPointIdx(state.coveragePolygon, img, canvas, evt)
+          : nearestPointIdx(targetKey, img, canvas, evt);
         if (idx >= 0) {
           state.drag = { target: targetKey, idx };
         }
@@ -689,11 +877,17 @@
         });
       }
       window.addEventListener('mousemove', (evt) => {
-        const targetKey = (key === 'planPoints' && state.drag.target === 'coveragePolygon') ? 'coveragePolygon' : key;
+        const targetKey = (side === 'plan' && state.drag.target === 'coveragePolygon') ? 'coveragePolygon' : side;
         if (state.drag.target !== targetKey || state.drag.idx < 0) return;
         const point = toImageCoords(evt, img, canvas);
-        state[targetKey][state.drag.idx] = { x: point.x, y: point.y };
-        if (targetKey === 'coveragePolygon') syncCoverageIntoEditor();
+        if (targetKey === 'coveragePolygon') {
+          state.coveragePolygon[state.drag.idx] = { x: point.x, y: point.y };
+          syncCoverageIntoEditor();
+        } else if (state.pointPairs[state.drag.idx]) {
+          state.pointPairs[state.drag.idx][targetKey] = { x: point.x, y: point.y };
+          resetComputedHomography();
+          syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
+        }
         redraw();
       });
       window.addEventListener('mouseup', () => {
@@ -785,12 +979,18 @@
       resetChessboardSources();
       const meta = state.cameraMetaById[normalizedCameraId];
       setCameraConfig(cameraConfigFromMeta(meta));
-      state.cameraPoints = [];
-      state.planPoints = [];
-      state.reprojected = [];
-      state.reprojError = null;
-      state.inliers = 0;
+      loadPointPairs(meta.point_pairs || []);
+      resetComputedHomography();
       state.matrix = meta.homography_ground || meta.homography_matrix || null;
+      const stats = meta.homography_stats || {};
+      state.reprojError = Number(stats.reprojection_error ?? 0) || null;
+      state.inlierReprojError = Number(stats.inlier_reprojection_error ?? 0) || null;
+      state.medianReprojError = Number(stats.median_reprojection_error ?? 0) || null;
+      state.maxReprojError = Number(stats.max_reprojection_error ?? 0) || null;
+      state.sourceCoverage = Number(stats.source_coverage ?? 0) || null;
+      state.destinationCoverage = Number(stats.destination_coverage ?? 0) || null;
+      state.inliers = Number(stats.inliers ?? 0) || 0;
+      state.inlierMask = Array.isArray(stats.inlier_mask) ? stats.inlier_mask.map((value) => Boolean(value)) : [];
       state.coveragePolygon = (meta.coverage_polygon || []).map((point) => ({ x: Number(point[0]), y: Number(point[1]) }));
       const floorPlanName = String(meta.floor_plan_image || '');
       if (floorPlanName && state.floorPlans.includes(floorPlanName)) {
@@ -804,13 +1004,9 @@
     function newCamera() {
       els.cameraSelect.value = '';
       resetChessboardSources();
-      state.cameraPoints = [];
-      state.planPoints = [];
+      state.pointPairs = [];
       state.coveragePolygon = [];
-      state.reprojected = [];
-      state.reprojError = null;
-      state.inliers = 0;
-      state.matrix = null;
+      resetComputedHomography();
       setCameraConfig(blankCameraConfig(''));
       setStatus('new camera draft ready', 'warn');
       redraw();
@@ -895,17 +1091,17 @@
     }
 
     async function computeHomography() {
-      const pairCount = Math.min(state.cameraPoints.length, state.planPoints.length);
-      if (pairCount < 4 || state.cameraPoints.length !== state.planPoints.length) {
-        throw new Error('need at least 4 paired points and equal counts on both canvases');
+      const pairs = completePairs();
+      if (pairs.length < 4 || incompletePairCount() > 0) {
+        throw new Error('need at least 4 complete pairs and no incomplete pairs');
       }
       setStatus('computing homography...', 'warn');
       const r = await fetch('/api/compute-homography', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          src_points: state.cameraPoints.map((point) => [point.x, point.y]),
-          dst_points: state.planPoints.map((point) => [point.x, point.y]),
+          src_points: pairs.map((pair) => [pair.camera.x, pair.camera.y]),
+          dst_points: pairs.map((pair) => [pair.plan.x, pair.plan.y]),
         }),
       });
       if (!r.ok) {
@@ -914,15 +1110,18 @@
       const body = await r.json();
       state.matrix = body.matrix || null;
       state.reprojected = (body.reprojected_points || []).map((point) => ({ x: Number(point[0]), y: Number(point[1]) }));
-      state.reprojError = Number(body.reprojection_error_px || 0);
+      state.reprojError = Number(body.reprojection_error || 0);
+      state.inlierReprojError = Number(body.inlier_reprojection_error || 0);
+      state.medianReprojError = Number(body.median_reprojection_error || 0);
+      state.maxReprojError = Number(body.max_reprojection_error || 0);
+      state.sourceCoverage = Number(body.source_coverage || 0);
+      state.destinationCoverage = Number(body.destination_coverage || 0);
       state.inliers = Number(body.inliers || 0);
+      state.inlierMask = Array.isArray(body.inlier_mask) ? body.inlier_mask.map((value) => Boolean(value)) : [];
       const estimator = String(body.estimator || 'RANSAC');
-      const cfg = currentCameraConfig(true);
-      cfg.matrix = state.matrix;
-      cfg.matrix_ground = state.matrix;
-      setCameraConfig(cfg);
+      syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: true });
       setStatus(
-        `homography ok | ${estimator} | error=${state.reprojError.toFixed(3)} px | inliers=${state.inliers}`,
+        `homography ok | ${estimator} | mean=${state.reprojError.toFixed(3)} px | inlier=${state.inlierReprojError.toFixed(3)} px | inliers=${state.inliers}/${pairs.length}`,
         'good',
       );
       redraw();
@@ -998,6 +1197,18 @@
         distortion_coefficients: cfg.distortion_coefficients || null,
         distortion_correction_mode: String(cfg.distortion_correction_mode || 'point'),
         coverage_polygon: state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]),
+        point_pairs: serializePointPairs(),
+        homography_stats: {
+          reprojection_error: state.reprojError,
+          inlier_reprojection_error: state.inlierReprojError,
+          median_reprojection_error: state.medianReprojError,
+          max_reprojection_error: state.maxReprojError,
+          source_coverage: state.sourceCoverage,
+          destination_coverage: state.destinationCoverage,
+          inliers: state.inliers,
+          total_pairs: completePairs().length,
+          inlier_mask: state.inlierMask,
+        },
       };
       setStatus(`saving ${cameraId}...`, 'warn');
       const r = await fetch('/api/save', {
@@ -1059,8 +1270,8 @@
     }
 
     function bind() {
-      wireCanvas(els.cameraCanvas, els.cameraImg, 'cameraPoints');
-      wireCanvas(els.planCanvas, els.planImg, 'planPoints');
+      wireCanvas(els.cameraCanvas, els.cameraImg, 'camera');
+      wireCanvas(els.planCanvas, els.planImg, 'plan');
       els.cameraSelect.addEventListener('change', async () => {
         try {
           await applySelectedCamera(els.cameraSelect.value);
@@ -1150,11 +1361,9 @@
         }
       });
       els.clearBtn.addEventListener('click', () => {
-        state.cameraPoints = [];
-        state.planPoints = [];
-        state.reprojected = [];
-        state.reprojError = null;
-        state.inliers = 0;
+        state.pointPairs = [];
+        resetComputedHomography();
+        syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
         setStatus('paired points cleared', 'warn');
         redraw();
       });
@@ -1167,7 +1376,11 @@
         setStatus('coverage polygon cleared', 'warn');
         redraw();
       });
-      els.cameraConfigEditor.addEventListener('input', () => updateButtons());
+      els.cameraConfigEditor.addEventListener('input', () => {
+        syncStateFromCameraEditor();
+        updateButtons();
+        redraw();
+      });
       els.siteConfigEditor.addEventListener('input', () => updateButtons());
       els.cameraImg.addEventListener('load', () => redraw());
       els.planImg.addEventListener('load', () => redraw());

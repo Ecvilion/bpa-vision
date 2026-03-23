@@ -8,11 +8,8 @@ Ported from vision_box.tools.calibration.app — stripped of vision_box deps.
 
 from __future__ import annotations
 
-import json
-import math
 import re
 import time
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +27,7 @@ from .distortion import (
     decode_image_bytes,
     undistort_image,
 )
-from .homography import _compute_homography_impl, reproject_points
+from .homography import _compute_homography_impl
 from .geometry import validate_homography_matrix
 
 
@@ -77,6 +74,9 @@ class CalibrationRuntime:
     calibration_dir: Path
     floor_plans_dir: Path
     camera_urls: dict[str, str]
+    camera_urls_path: Path | None = None
+    site_config_path: Path | None = None
+    perception_config_path: Path | None = None
     camera_frame_width: int = 2560
     camera_frame_height: int = 1440
 
@@ -106,6 +106,21 @@ class CalibrationRuntime:
         )
         return path
 
+    def calibration_camera_ids(self) -> list[str]:
+        if not self.calibration_dir.exists():
+            return []
+        prefix = "calibration_"
+        suffix = ".yaml"
+        ids: set[str] = set()
+        for item in self.calibration_dir.glob(f"{prefix}*{suffix}"):
+            name = item.name
+            if name.startswith(prefix) and name.endswith(suffix):
+                ids.add(name[len(prefix):-len(suffix)])
+        return sorted(ids)
+
+    def all_camera_ids(self) -> list[str]:
+        return sorted(set(self.camera_urls) | set(self.calibration_camera_ids()))
+
     def floor_plan_file(self, filename: str) -> Path:
         safe = sanitize_filename(filename)
         base = self.floor_plans_dir.resolve()
@@ -127,15 +142,33 @@ class ComputeHomographyRequest(BaseModel):
     dst_points: list[list[float]]
 
 
+class CalibrationPointPair(BaseModel):
+    camera_point: list[float] | None = None
+    plan_point: list[float] | None = None
+
+
 class SaveCalibrationRequest(BaseModel):
     camera_id: str
+    rtsp_url: str | None = None
+    anchor_point: str | None = None
     matrix: list[list[float]] | None = None
+    matrix_ground: list[list[float]] | None = None
+    matrix_hip: list[list[float]] | None = None
+    matrix_head: list[list[float]] | None = None
     floor_plan_filename: str = ""
     frame_width: int | None = None
     frame_height: int | None = None
     intrinsic_matrix: list[list[float]] | None = None
     distortion_coefficients: list[float] | None = None
     distortion_correction_mode: str | None = None
+    coverage_polygon: list[list[float]] | None = None
+    point_pairs: list[CalibrationPointPair] | None = None
+    homography_stats: dict[str, Any] | None = None
+
+
+def _camera_has_valid_homography(calibration: dict[str, Any]) -> bool:
+    matrix = calibration.get("homography_ground") or calibration.get("homography_matrix")
+    return not _is_identity_homography(matrix)
 
 
 class CaptureFrameRequest(BaseModel):
@@ -213,25 +246,39 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             "camera_frame_height": runtime.camera_frame_height,
             "calibration_dir": str(runtime.calibration_dir),
             "floor_plans_dir": str(runtime.floor_plans_dir),
+            "site_config_path": str(runtime.site_config_path) if runtime.site_config_path else "",
+            "camera_urls_path": str(runtime.camera_urls_path) if runtime.camera_urls_path else "",
+            "floor_plans_dir_path": str(runtime.floor_plans_dir),
+            "perception_config_path": (
+                str(runtime.perception_config_path) if runtime.perception_config_path else ""
+            ),
         })
 
     @app.get("/api/cameras")
     async def cameras() -> JSONResponse:
         out: list[dict[str, Any]] = []
-        for camera_id, rtsp_url in runtime.camera_urls.items():
+        for camera_id in runtime.all_camera_ids():
             cal = runtime.load_camera_calibration(camera_id)
-            matrix = cal.get("homography_matrix")
+            rtsp_url = runtime.camera_urls.get(camera_id) or cal.get("rtsp_url", "")
+            matrix = cal.get("homography_ground") or cal.get("homography_matrix")
             out.append({
                 "camera_id": camera_id,
-                "has_homography": bool(not _is_identity_homography(matrix)),
+                "has_homography": _camera_has_valid_homography(cal),
                 "rtsp_url": rtsp_url,
-                "homography_matrix": matrix,
+                "anchor_point": cal.get("anchor_point", "bottom_center"),
+                "homography_matrix": cal.get("homography_matrix"),
+                "homography_ground": cal.get("homography_ground") or matrix,
+                "homography_hip": cal.get("homography_hip"),
+                "homography_head": cal.get("homography_head"),
                 "floor_plan_image": cal.get("floor_plan_image"),
                 "frame_width": cal.get("frame_width"),
                 "frame_height": cal.get("frame_height"),
                 "intrinsic_matrix": cal.get("intrinsic_matrix"),
                 "distortion_coefficients": cal.get("distortion_coefficients"),
                 "distortion_correction_mode": cal.get("distortion_correction_mode", "none"),
+                "coverage_polygon": cal.get("coverage_polygon", []),
+                "point_pairs": cal.get("point_pairs", []),
+                "homography_stats": cal.get("homography_stats", {}),
             })
         return JSONResponse({"cameras": sorted(out, key=lambda x: x["camera_id"])})
 
@@ -264,7 +311,7 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
         dest.write_bytes(content)
         return JSONResponse({"filename": safe_name, "size": len(content)})
 
-    @app.post("/api/capture-frame")
+    @app.post("/api/camera/frame")
     async def capture_frame_endpoint(req: CaptureFrameRequest) -> Response:
         rtsp_url = req.rtsp_url
         if not rtsp_url and req.camera_id:
@@ -296,31 +343,54 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
 
         return Response(content=jpeg, media_type="image/jpeg")
 
-    @app.post("/api/compute-homography")
+    @app.post("/api/compute-homography")  # also aliased below
     async def compute_homography_endpoint(req: ComputeHomographyRequest) -> JSONResponse:
         try:
-            matrix, error, inliers, estimator = _compute_homography_impl(
-                req.src_points, req.dst_points
-            )
+            result = _compute_homography_impl(req.src_points, req.dst_points)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return JSONResponse({
-            "matrix": matrix,
-            "reprojection_error": error,
-            "inliers": inliers,
-            "estimator": estimator,
+            "matrix": result.matrix,
+            "reprojected_points": [
+                [float(point[0]), float(point[1])]
+                for point in result.reprojected_points
+            ],
+            "inlier_mask": list(result.inlier_mask),
+            "reprojection_error": result.reprojection_error,
+            "inlier_reprojection_error": result.inlier_reprojection_error,
+            "median_reprojection_error": result.median_reprojection_error,
+            "max_reprojection_error": result.max_reprojection_error,
+            "source_coverage": result.source_coverage,
+            "destination_coverage": result.destination_coverage,
+            "inliers": result.inliers,
+            "estimator": result.estimator,
         })
 
-    @app.post("/api/save-calibration")
+    @app.post("/api/save")
     async def save_calibration(req: SaveCalibrationRequest) -> JSONResponse:
         cam_id = req.camera_id.strip()
         if not cam_id:
             raise HTTPException(status_code=400, detail="camera_id required")
 
         cal = runtime.load_camera_calibration(cam_id)
-        if req.matrix:
-            validate_homography_matrix(req.matrix, cam_id)
-            cal["homography_matrix"] = req.matrix
+
+        def _save_matrix(field_name: str, matrix: list[list[float]] | None) -> bool:
+            if not matrix:
+                return False
+            validate_homography_matrix(matrix, f"{cam_id}:{field_name}")
+            cal[field_name] = matrix
+            return True
+
+        saved_planes = {
+            "base": _save_matrix("homography_matrix", req.matrix),
+            "ground": _save_matrix("homography_ground", req.matrix_ground or req.matrix),
+            "hip": _save_matrix("homography_hip", req.matrix_hip),
+            "head": _save_matrix("homography_head", req.matrix_head),
+        }
+        if req.rtsp_url is not None:
+            cal["rtsp_url"] = req.rtsp_url
+        if req.anchor_point:
+            cal["anchor_point"] = req.anchor_point
         if req.floor_plan_filename:
             cal["floor_plan_image"] = req.floor_plan_filename
         if req.frame_width:
@@ -333,15 +403,22 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             cal["distortion_coefficients"] = req.distortion_coefficients
         if req.distortion_correction_mode:
             cal["distortion_correction_mode"] = req.distortion_correction_mode
+        if req.coverage_polygon is not None:
+            cal["coverage_polygon"] = req.coverage_polygon
+        if req.point_pairs is not None:
+            cal["point_pairs"] = [pair.model_dump() for pair in req.point_pairs]
+        if req.homography_stats is not None:
+            cal["homography_stats"] = req.homography_stats
 
         path = runtime.save_camera_calibration(cam_id, cal)
         return JSONResponse({
             "ok": True,
             "path": str(path),
             "saved_at": _utcnow().isoformat(),
+            "saved_planes": saved_planes,
         })
 
-    @app.post("/api/calibrate-distortion")
+    @app.post("/api/distortion/calibrate")
     async def calibrate_distortion(
         pattern_cols: int = Form(...),
         pattern_rows: int = Form(...),
@@ -379,5 +456,52 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             "detected_files": list(result.detected_files),
             "rejected_files": list(result.rejected_files),
         })
+
+    @app.get("/api/readiness")
+    async def readiness() -> JSONResponse:
+        camera_checks: list[dict[str, Any]] = []
+        for camera_id in runtime.all_camera_ids():
+            cal = runtime.load_camera_calibration(camera_id)
+            has_homography = _camera_has_valid_homography(cal)
+            has_floor_plan = bool(cal.get("floor_plan_image"))
+            has_coverage = len(cal.get("coverage_polygon") or []) >= 3
+            has_distortion = bool(
+                cal.get("intrinsic_matrix") and cal.get("distortion_coefficients")
+            )
+            point_pairs = cal.get("point_pairs") or []
+            has_enough_pairs = sum(
+                1
+                for pair in point_pairs
+                if isinstance(pair, dict) and pair.get("camera_point") and pair.get("plan_point")
+            ) >= 4
+            single_ready = has_homography and has_floor_plan
+            multicam_ready = single_ready and has_coverage
+            camera_checks.append({
+                "camera_id": camera_id,
+                "single_ready": single_ready,
+                "multicam_ready": multicam_ready,
+                "has_homography": has_homography,
+                "has_floor_plan": has_floor_plan,
+                "has_distortion": has_distortion,
+                "has_enough_pairs": has_enough_pairs,
+                "has_coverage": has_coverage,
+            })
+
+        total_cameras = len(camera_checks)
+        single_camera_ready_count = sum(1 for item in camera_checks if item["single_ready"])
+        multicam_ready_count = sum(1 for item in camera_checks if item["multicam_ready"])
+        site_spatial_ready = total_cameras > 0 and single_camera_ready_count == total_cameras
+        return JSONResponse({
+            "ok": True,
+            "site_spatial_ready": site_spatial_ready,
+            "total_cameras": total_cameras,
+            "single_camera_ready_count": single_camera_ready_count,
+            "multicam_ready_count": multicam_ready_count,
+            "checks": camera_checks,
+        })
+
+    @app.post("/api/save-site")
+    async def save_site_settings() -> JSONResponse:
+        return JSONResponse({"ok": True, "detail": "not implemented in bpa-vision"})
 
     return app

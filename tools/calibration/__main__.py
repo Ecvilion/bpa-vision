@@ -58,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         calibration_dir=configs_dir,
         floor_plans_dir=floor_plans_dir,
         camera_urls=camera_urls,
+        camera_urls_path=sources_path,
         camera_frame_width=args.camera_frame_width,
         camera_frame_height=args.camera_frame_height,
     )
