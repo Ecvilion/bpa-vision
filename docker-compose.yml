@@ -27,3 +27,4 @@ services:
         --output-dir /app/output
         --conf-threshold 0.25
         --stream-port 5555
+        --calibration-dir /app/configs

@@ -27,3 +27,7 @@ models/*.pt
 # Local overrides with credentials
 docker-compose.override.yml
 configs/sources.local.json
+
+# Calibration backups and generated dewarper configs
+configs/calibration_*.yaml.bak.*
+output/dewarper_configs/

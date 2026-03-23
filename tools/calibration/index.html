@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Vision Box Homography Calibration</title>
+  <style>
+    :root {
+      --bg:#0f141a;
+      --panel:#171f28;
+      --ink:#e7eef5;
+      --muted:#a2b1bf;
+      --line:#2b3642;
+      --accent:#63d9be;
+      --warn:#ffcc66;
+      --bad:#ff7777;
+      --soft:#4db7ff;
+    }
+    body {
+      margin:0;
+      background:var(--bg);
+      color:var(--ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    header {
+      padding:10px 14px;
+      border-bottom:1px solid var(--line);
+      display:flex;
+      gap:10px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    button, select, input, textarea {
+      background:#121820;
+      color:var(--ink);
+      border:1px solid var(--line);
+      border-radius:6px;
+      padding:6px 8px;
+      font:inherit;
+    }
+    textarea {
+      width:100%;
+      min-height:260px;
+      resize:vertical;
+      line-height:1.35;
+    }
+    button { cursor:pointer; }
+    button:disabled {
+      opacity:0.55;
+      cursor:not-allowed;
+    }
+    .toolbar {
+      padding:8px 12px 14px;
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+      align-items:center;
+      border-top:1px solid var(--line);
+    }
+    .grid {
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:12px;
+      padding:12px;
+    }
+    .panel {
+      background:var(--panel);
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:10px;
+    }
+    .title {
+      font-size:13px;
+      margin-bottom:8px;
+      color:var(--muted);
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+    }
+    .stage {
+      position:relative;
+      background:#0b0f14;
+      min-height:320px;
+      border:1px solid var(--line);
+      border-radius:6px;
+      overflow:hidden;
+    }
+    img {
+      display:block;
+      width:100%;
+      height:auto;
+      user-select:none;
+      -webkit-user-drag:none;
+    }
+    canvas {
+      position:absolute;
+      left:0;
+      top:0;
+      width:100%;
+      height:100%;
+    }
+    .editor-grid {
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:12px;
+      padding:0 12px 12px;
+    }
+    .meta {
+      color:var(--muted);
+      font-size:12px;
+      white-space:pre-wrap;
+    }
+    .good { color:var(--accent); }
+    .warn { color:var(--warn); }
+    .bad { color:var(--bad); }
+    .tip {
+      color:var(--muted);
+      font-size:12px;
+      margin-top:8px;
+      line-height:1.4;
+    }
+    .capture-strip {
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+      align-items:flex-start;
+    }
+    .capture-thumb-wrap {
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      max-width:116px;
+    }
+    .capture-thumb {
+      width:116px;
+      height:68px;
+      object-fit:cover;
+      border:1px solid var(--line);
+      border-radius:6px;
+      background:#0b0f14;
+    }
+    @media (max-width: 1200px) {
+      .grid, .editor-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Calibration + Camera Config Tool</strong>
+    <span style="color:var(--muted);font-size:12px;">Left: camera frame. Right: floor plan. Click paired points in same order. If you calibrate distortion from a chessboard, use "Capture Undistorted" before placing homography points. Camera/site settings are editable below as JSON.</span>
+  </header>
+
+  <div class="toolbar">
+    <label>camera:</label>
+    <select id="cameraSelect"></select>
+    <button id="newCameraBtn" type="button">New Camera</button>
+    <button id="captureBtn">Capture Frame</button>
+    <button id="captureUndistortedBtn" type="button">Capture Undistorted</button>
+    <label>floor plan:</label>
+    <select id="planSelect"></select>
+    <input id="uploadInput" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp">
+    <button id="computeBtn" disabled>Compute Homography</button>
+    <button id="saveBtn" disabled>Save Camera Config</button>
+    <button id="saveSiteBtn" disabled>Save Site Settings</button>
+    <button id="clearBtn" type="button">Clear Points</button>
+    <button id="coverageModeBtn" type="button">Coverage Mode: Off</button>
+    <button id="clearCoverageBtn" type="button">Clear Coverage</button>
+    <span id="status" class="meta">loading...</span>
+  </div>
+
+  <div class="toolbar" style="border-top:0;padding-top:0;">
+    <label>chessboard cols:</label>
+    <input id="chessboardColsInput" type="number" min="2" step="1" value="9" style="width:72px;">
+    <label>rows:</label>
+    <input id="chessboardRowsInput" type="number" min="2" step="1" value="6" style="width:72px;">
+    <label>square:</label>
+    <input id="chessboardSquareInput" type="number" min="0.001" step="0.001" value="1.0" style="width:88px;">
+    <input id="chessboardUploadInput" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp" multiple>
+    <button id="captureChessboardBtn" type="button">Capture Chessboard</button>
+    <button id="resetChessboardBtn" type="button">Reset Chessboard Set</button>
+    <button id="calibrateDistortionBtn" type="button">Calibrate Distortion</button>
+    <span id="chessboardSourceMeta" class="meta">distortion frames: upload=0 | captured=0 | total=0</span>
+  </div>
+
+  <div class="toolbar" style="border-top:0;padding-top:0;">
+    <div id="chessboardCaptureStrip" class="capture-strip">
+      <span class="meta">Captured chessboard frames will appear here.</span>
+    </div>
+  </div>
+
+  <div class="toolbar" style="border-top:0;padding-top:0;">
+    <span id="readiness" class="meta">readiness: loading...</span>
+    <span id="paths" class="meta"></span>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="title">
+        <span>Camera Frame</span>
+        <span id="cameraStageMeta" class="meta"></span>
+      </div>
+      <div class="stage">
+        <img id="cameraImg" alt="camera frame">
+        <canvas id="cameraCanvas"></canvas>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="title">
+        <span>Floor Plan</span>
+        <span id="planStageMeta" class="meta"></span>
+      </div>
+      <div class="stage">
+        <img id="planImg" alt="floor plan">
+        <canvas id="planCanvas"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="editor-grid">
+    <div class="panel">
+      <div class="title">Camera Config JSON</div>
+      <textarea id="cameraConfigEditor" spellcheck="false"></textarea>
+      <div class="tip">
+        Fields supported here: `camera_id`, `rtsp_url`, `anchor_point`, `frame_width`, `frame_height`,
+        `matrix`, `matrix_ground`, `matrix_hip`, `matrix_head`, `intrinsic_matrix`,
+        `distortion_coefficients`, `distortion_correction_mode`, `floor_plan_filename`.
+        Coverage polygon is edited on the map and synced into this JSON.
+      </div>
+    </div>
+    <div class="panel">
+      <div class="title">Site Settings JSON</div>
+      <textarea id="siteConfigEditor" spellcheck="false"></textarea>
+      <div class="tip">
+        Fields supported here: `site_id`, `floor_plans_dir`, `projection_smoothing_alpha`,
+        `projection_outlier_max_speed_mps`, `projection_outlier_slack_map`,
+        `anchor_hysteresis_frames`, `occlusion_hold_ms`.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      configMeta: null,
+      cameras: [],
+      cameraMetaById: {},
+      floorPlans: [],
+      cameraPoints: [],
+      planPoints: [],
+      coveragePolygon: [],
+      coverageMode: false,
+      reprojected: [],
+      matrix: null,
+      reprojError: null,
+      inliers: 0,
+      drag: { target: null, idx: -1 },
+      hoverGuides: {
+        camera: null,
+        plan: null,
+      },
+      chessboardCaptures: [],
+      cameraFrameObjectUrl: null,
+    };
+
+    const els = {
+      cameraSelect: document.getElementById('cameraSelect'),
+      newCameraBtn: document.getElementById('newCameraBtn'),
+      captureBtn: document.getElementById('captureBtn'),
+      captureUndistortedBtn: document.getElementById('captureUndistortedBtn'),
+      planSelect: document.getElementById('planSelect'),
+      uploadInput: document.getElementById('uploadInput'),
+      chessboardColsInput: document.getElementById('chessboardColsInput'),
+      chessboardRowsInput: document.getElementById('chessboardRowsInput'),
+      chessboardSquareInput: document.getElementById('chessboardSquareInput'),
+      chessboardUploadInput: document.getElementById('chessboardUploadInput'),
+      captureChessboardBtn: document.getElementById('captureChessboardBtn'),
+      resetChessboardBtn: document.getElementById('resetChessboardBtn'),
+      calibrateDistortionBtn: document.getElementById('calibrateDistortionBtn'),
+      chessboardSourceMeta: document.getElementById('chessboardSourceMeta'),
+      chessboardCaptureStrip: document.getElementById('chessboardCaptureStrip'),
+      computeBtn: document.getElementById('computeBtn'),
+      saveBtn: document.getElementById('saveBtn'),
+      saveSiteBtn: document.getElementById('saveSiteBtn'),
+      clearBtn: document.getElementById('clearBtn'),
+      coverageModeBtn: document.getElementById('coverageModeBtn'),
+      clearCoverageBtn: document.getElementById('clearCoverageBtn'),
+      status: document.getElementById('status'),
+      readiness: document.getElementById('readiness'),
+      paths: document.getElementById('paths'),
+      cameraStageMeta: document.getElementById('cameraStageMeta'),
+      planStageMeta: document.getElementById('planStageMeta'),
+      cameraImg: document.getElementById('cameraImg'),
+      planImg: document.getElementById('planImg'),
+      cameraCanvas: document.getElementById('cameraCanvas'),
+      planCanvas: document.getElementById('planCanvas'),
+      cameraConfigEditor: document.getElementById('cameraConfigEditor'),
+      siteConfigEditor: document.getElementById('siteConfigEditor'),
+    };
+
+    function formatJson(value) {
+      return JSON.stringify(value, null, 2);
+    }
+
+    function setStatus(text, cls = '') {
+      els.status.className = `meta ${cls}`.trim();
+      els.status.textContent = text;
+    }
+
+    function setReadiness(text, cls = '') {
+      els.readiness.className = `meta ${cls}`.trim();
+      els.readiness.textContent = text;
+    }
+
+    function setPaths(text) {
+      els.paths.textContent = text;
+    }
+
+    function setCoverageMode(enabled) {
+      state.coverageMode = Boolean(enabled);
+      els.coverageModeBtn.textContent = `Coverage Mode: ${state.coverageMode ? 'On' : 'Off'}`;
+      els.coverageModeBtn.className = state.coverageMode ? 'warn' : '';
+    }
+
+    function parseJsonArea(area, label, strict = true) {
+      const raw = String(area.value || '').trim();
+      if (!raw) {
+        if (strict) throw new Error(`${label} is empty`);
+        return null;
+      }
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        if (strict) throw new Error(`${label} JSON parse error: ${e.message}`);
+        return null;
+      }
+    }
+
+    function currentCameraConfig(strict = true) {
+      const parsed = parseJsonArea(els.cameraConfigEditor, 'camera config', strict);
+      if (parsed === null) return null;
+      if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+        if (strict) throw new Error('camera config must be a JSON object');
+        return null;
+      }
+      return parsed;
+    }
+
+    function currentSiteConfig(strict = true) {
+      const parsed = parseJsonArea(els.siteConfigEditor, 'site settings', strict);
+      if (parsed === null) return null;
+      if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+        if (strict) throw new Error('site settings must be a JSON object');
+        return null;
+      }
+      return parsed;
+    }
+
+    function setCameraConfig(obj) {
+      els.cameraConfigEditor.value = formatJson(obj);
+      updateButtons();
+    }
+
+    function setSiteConfig(obj) {
+      els.siteConfigEditor.value = formatJson(obj);
+      updateButtons();
+    }
+
+    function buildCaptureFilename(prefix, index, blobType = '') {
+      const cfg = currentCameraConfig(false);
+      const cameraId = String(cfg?.camera_id || els.cameraSelect.value || 'camera').trim() || 'camera';
+      const safeCameraId = cameraId.replace(/[^a-zA-Z0-9_-]+/g, '_');
+      const ext = String(blobType || '').includes('png') ? 'png' : 'jpg';
+      return `${safeCameraId}_${prefix}_${String(index).padStart(2, '0')}.${ext}`;
+    }
+
+    function resetChessboardCaptures() {
+      state.chessboardCaptures.forEach((capture) => {
+        if (capture.url) URL.revokeObjectURL(capture.url);
+      });
+      state.chessboardCaptures = [];
+      renderChessboardCaptureStrip();
+      updateButtons();
+    }
+
+    function resetChessboardSources() {
+      resetChessboardCaptures();
+      els.chessboardUploadInput.value = '';
+      updateButtons();
+    }
+
+    function renderChessboardCaptureStrip() {
+      els.chessboardCaptureStrip.innerHTML = '';
+      if (!state.chessboardCaptures.length) {
+        const hint = document.createElement('span');
+        hint.className = 'meta';
+        hint.textContent = 'Captured chessboard frames will appear here.';
+        els.chessboardCaptureStrip.appendChild(hint);
+        return;
+      }
+      state.chessboardCaptures.forEach((capture, idx) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'capture-thumb-wrap';
+        const img = document.createElement('img');
+        img.className = 'capture-thumb';
+        img.src = capture.url;
+        img.alt = capture.name;
+        const meta = document.createElement('span');
+        meta.className = 'meta';
+        meta.textContent = `#${idx + 1} ${capture.name}`;
+        wrap.appendChild(img);
+        wrap.appendChild(meta);
+        els.chessboardCaptureStrip.appendChild(wrap);
+      });
+    }
+
+    function updateChessboardSourceMeta() {
+      const uploadedCount = Array.from(els.chessboardUploadInput.files || []).length;
+      const capturedCount = state.chessboardCaptures.length;
+      const totalCount = uploadedCount + capturedCount;
+      els.chessboardSourceMeta.textContent = `distortion frames: upload=${uploadedCount} | captured=${capturedCount} | total=${totalCount}`;
+      els.calibrateDistortionBtn.disabled = totalCount < 1;
+      const cfg = currentCameraConfig(false);
+      const hasCameraSource = Boolean(
+        cfg && (String(cfg.camera_id || '').trim() || String(cfg.rtsp_url || '').trim()),
+      );
+      els.captureChessboardBtn.disabled = !hasCameraSource;
+    }
+
+    function blankCameraConfig(cameraId = '') {
+      return {
+        camera_id: String(cameraId || '').trim(),
+        rtsp_url: '',
+        anchor_point: 'bottom_center',
+        floor_plan_filename: String(els.planSelect.value || ''),
+        frame_width: Number(state.configMeta?.camera_frame_width || 0) || null,
+        frame_height: Number(state.configMeta?.camera_frame_height || 0) || null,
+        matrix: null,
+        matrix_ground: null,
+        matrix_hip: null,
+        matrix_head: null,
+        intrinsic_matrix: null,
+        distortion_coefficients: null,
+        distortion_correction_mode: 'point',
+        coverage_polygon: [],
+      };
+    }
+
+    function cameraConfigFromMeta(meta) {
+      return {
+        camera_id: String(meta.camera_id || ''),
+        rtsp_url: String(meta.rtsp_url || ''),
+        anchor_point: String(meta.anchor_point || 'bottom_center'),
+        floor_plan_filename: String(meta.floor_plan_image || els.planSelect.value || ''),
+        frame_width: meta.frame_width ?? (Number(state.configMeta?.camera_frame_width || 0) || null),
+        frame_height: meta.frame_height ?? (Number(state.configMeta?.camera_frame_height || 0) || null),
+        matrix: meta.homography_matrix || null,
+        matrix_ground: meta.homography_ground || meta.homography_matrix || null,
+        matrix_hip: meta.homography_hip || null,
+        matrix_head: meta.homography_head || null,
+        intrinsic_matrix: meta.intrinsic_matrix || null,
+        distortion_coefficients: meta.distortion_coefficients || null,
+        distortion_correction_mode: String(meta.distortion_correction_mode || 'point'),
+        coverage_polygon: (meta.coverage_polygon || []).map((point) => [Number(point[0]), Number(point[1])]),
+      };
+    }
+
+    function siteConfigFromMeta(meta) {
+      return {
+        site_id: String(meta?.site_id || 'site-default'),
+        floor_plans_dir: String(meta?.floor_plans_dir || 'config/floor_plans'),
+        projection_smoothing_alpha: Number(meta?.projection_smoothing_alpha ?? 0.3),
+        projection_outlier_max_speed_mps: Number(meta?.projection_outlier_max_speed_mps ?? 2.0),
+        projection_outlier_slack_map: Number(meta?.projection_outlier_slack_map ?? 0.5),
+        anchor_hysteresis_frames: Number(meta?.anchor_hysteresis_frames ?? 2),
+        occlusion_hold_ms: Number(meta?.occlusion_hold_ms ?? 1200),
+      };
+    }
+
+    function syncCoverageIntoEditor() {
+      const cfg = currentCameraConfig(false);
+      if (!cfg) return;
+      cfg.coverage_polygon = state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]);
+      cfg.floor_plan_filename = String(els.planSelect.value || cfg.floor_plan_filename || '');
+      setCameraConfig(cfg);
+    }
+
+    function updateStageMeta() {
+      const cfg = currentCameraConfig(false);
+      const cameraId = String(cfg?.camera_id || '');
+      const cameraSize = (els.cameraImg.naturalWidth && els.cameraImg.naturalHeight)
+        ? `${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight}`
+        : 'no frame';
+      els.cameraStageMeta.textContent = `${cameraId || 'unsaved camera'} | ${cameraSize}`;
+      const planName = String(els.planSelect.value || cfg?.floor_plan_filename || '');
+      const planSize = (els.planImg.naturalWidth && els.planImg.naturalHeight)
+        ? `${els.planImg.naturalWidth}x${els.planImg.naturalHeight}`
+        : 'no plan';
+      els.planStageMeta.textContent = `${planName || 'no floor plan'} | ${planSize}`;
+    }
+
+    function updateButtons() {
+      const pairCount = Math.min(state.cameraPoints.length, state.planPoints.length);
+      const balanced = state.cameraPoints.length === state.planPoints.length;
+      els.computeBtn.disabled = !(pairCount >= 4 && balanced);
+      const cfg = currentCameraConfig(false);
+      els.saveBtn.disabled = !(cfg && String(cfg.camera_id || '').trim() && String(els.planSelect.value || '').trim());
+      els.saveSiteBtn.disabled = !(currentSiteConfig(false));
+      updateStageMeta();
+      updateChessboardSourceMeta();
+    }
+
+    function fitCanvas(img, canvas) {
+      const w = img.clientWidth || img.naturalWidth || 1;
+      const h = img.clientHeight || img.naturalHeight || 1;
+      canvas.width = w;
+      canvas.height = h;
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${h}px`;
+    }
+
+    function toImageCoords(evt, img, canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const nx = img.naturalWidth || canvas.width || 1;
+      const ny = img.naturalHeight || canvas.height || 1;
+      const sx = nx / Math.max(1, rect.width);
+      const sy = ny / Math.max(1, rect.height);
+      return {
+        x: (evt.clientX - rect.left) * sx,
+        y: (evt.clientY - rect.top) * sy,
+      };
+    }
+
+    function toScreenCoords(point, img, canvas) {
+      const nx = img.naturalWidth || canvas.width || 1;
+      const ny = img.naturalHeight || canvas.height || 1;
+      const sx = canvas.width / Math.max(1, nx);
+      const sy = canvas.height / Math.max(1, ny);
+      return { x: point.x * sx, y: point.y * sy };
+    }
+
+    function drawPoints(canvas, img, points, color, reprojected = [], polygon = [], guides = null) {
+      fitCanvas(img, canvas);
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (guides) {
+        const guidePoint = toScreenCoords(guides, img, canvas);
+        ctx.save();
+        ctx.setLineDash([6, 6]);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(77, 183, 255, 0.75)';
+        ctx.beginPath();
+        ctx.moveTo(guidePoint.x, 0);
+        ctx.lineTo(guidePoint.x, canvas.height);
+        ctx.moveTo(0, guidePoint.y);
+        ctx.lineTo(canvas.width, guidePoint.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(77, 183, 255, 0.95)';
+        ctx.font = '12px ui-monospace, monospace';
+        ctx.fillText(`x=${Math.round(guides.x)} y=${Math.round(guides.y)}`, guidePoint.x + 10, Math.max(14, guidePoint.y - 10));
+        ctx.restore();
+      }
+      if (polygon.length >= 2) {
+        ctx.strokeStyle = '#4db7ff';
+        ctx.fillStyle = 'rgba(77, 183, 255, 0.12)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        polygon.forEach((point, idx) => {
+          const p = toScreenCoords(point, img, canvas);
+          if (idx === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = '#4db7ff';
+        polygon.forEach((point, idx) => {
+          const p = toScreenCoords(point, img, canvas);
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillText(`C${idx + 1}`, p.x + 8, p.y + 12);
+        });
+      }
+      ctx.lineWidth = 2;
+      ctx.font = '12px ui-monospace, monospace';
+      points.forEach((point, idx) => {
+        const p = toScreenCoords(point, img, canvas);
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillText(String(idx + 1), p.x + 8, p.y - 8);
+      });
+      reprojected.forEach((point) => {
+        const p = toScreenCoords(point, img, canvas);
+        ctx.strokeStyle = '#4db7ff';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+    }
+
+    function redraw() {
+      drawPoints(
+        els.cameraCanvas,
+        els.cameraImg,
+        state.cameraPoints,
+        '#ffd166',
+        [],
+        [],
+        null,
+      );
+      drawPoints(
+        els.planCanvas,
+        els.planImg,
+        state.planPoints,
+        '#63d9be',
+        state.reprojected,
+        state.coveragePolygon,
+        state.hoverGuides.plan,
+      );
+      updateButtons();
+    }
+
+    function nearestPointIdx(points, img, canvas, evt) {
+      if (!points.length) return -1;
+      const rect = canvas.getBoundingClientRect();
+      const mx = evt.clientX - rect.left;
+      const my = evt.clientY - rect.top;
+      let best = -1;
+      let bestDist = 1e9;
+      points.forEach((point, idx) => {
+        const p = toScreenCoords(point, img, canvas);
+        const dx = p.x - mx;
+        const dy = p.y - my;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = idx;
+        }
+      });
+      return bestDist <= 14 ? best : -1;
+    }
+
+    function wireCanvas(canvas, img, key) {
+      const guideKey = key === 'planPoints' ? 'plan' : null;
+      canvas.addEventListener('click', (evt) => {
+        if (state.drag.target) return;
+        const point = toImageCoords(evt, img, canvas);
+        const targetKey = (key === 'planPoints' && state.coverageMode) ? 'coveragePolygon' : key;
+        state[targetKey].push({ x: point.x, y: point.y });
+        state.matrix = null;
+        state.reprojected = [];
+        if (targetKey === 'coveragePolygon') syncCoverageIntoEditor();
+        setStatus(`point #${state[targetKey].length} added on ${targetKey}`, 'warn');
+        redraw();
+      });
+      canvas.addEventListener('contextmenu', (evt) => {
+        evt.preventDefault();
+        const targetKey = (key === 'planPoints' && state.coverageMode) ? 'coveragePolygon' : key;
+        const idx = nearestPointIdx(state[targetKey], img, canvas, evt);
+        if (idx >= 0) {
+          state[targetKey].splice(idx, 1);
+          state.matrix = null;
+          state.reprojected = [];
+          if (targetKey === 'coveragePolygon') syncCoverageIntoEditor();
+          setStatus(`point #${idx + 1} removed`, 'warn');
+          redraw();
+        }
+      });
+      canvas.addEventListener('mousedown', (evt) => {
+        const targetKey = (key === 'planPoints' && state.coverageMode) ? 'coveragePolygon' : key;
+        const idx = nearestPointIdx(state[targetKey], img, canvas, evt);
+        if (idx >= 0) {
+          state.drag = { target: targetKey, idx };
+        }
+      });
+      if (guideKey) {
+        canvas.addEventListener('mousemove', (evt) => {
+          state.hoverGuides[guideKey] = toImageCoords(evt, img, canvas);
+          redraw();
+        });
+        canvas.addEventListener('mouseleave', () => {
+          state.hoverGuides[guideKey] = null;
+          redraw();
+        });
+      }
+      window.addEventListener('mousemove', (evt) => {
+        const targetKey = (key === 'planPoints' && state.drag.target === 'coveragePolygon') ? 'coveragePolygon' : key;
+        if (state.drag.target !== targetKey || state.drag.idx < 0) return;
+        const point = toImageCoords(evt, img, canvas);
+        state[targetKey][state.drag.idx] = { x: point.x, y: point.y };
+        if (targetKey === 'coveragePolygon') syncCoverageIntoEditor();
+        redraw();
+      });
+      window.addEventListener('mouseup', () => {
+        state.drag = { target: null, idx: -1 };
+      });
+    }
+
+    async function loadConfig() {
+      const r = await fetch('/api/config');
+      if (!r.ok) throw new Error('failed to load config meta');
+      const body = await r.json();
+      state.configMeta = body;
+      setSiteConfig(siteConfigFromMeta(body));
+      const pathBits = [
+        `site=${body.site_config_path}`,
+        `camera_urls=${body.camera_urls_path}`,
+        `floor_plans=${body.floor_plans_dir_path}`,
+        (body.perception_config_path ? `perception=${body.perception_config_path}` : 'perception=disabled'),
+      ];
+      setPaths(pathBits.join(' | '));
+    }
+
+    async function loadCameras() {
+      const currentCfg = currentCameraConfig(false);
+      const desiredCameraId = String(currentCfg?.camera_id || els.cameraSelect.value || '').trim();
+      const r = await fetch('/api/cameras');
+      if (!r.ok) throw new Error('failed to load cameras');
+      const body = await r.json();
+      state.cameras = body.cameras || [];
+      state.cameraMetaById = {};
+      els.cameraSelect.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = '(new / unsaved camera)';
+      els.cameraSelect.appendChild(placeholder);
+      state.cameras.forEach((camera) => {
+        state.cameraMetaById[camera.camera_id] = camera;
+        const opt = document.createElement('option');
+        opt.value = camera.camera_id;
+        opt.textContent = `${camera.camera_id}${camera.has_homography ? ' (configured)' : ''}`;
+        els.cameraSelect.appendChild(opt);
+      });
+      if (desiredCameraId && state.cameraMetaById[desiredCameraId]) {
+        els.cameraSelect.value = desiredCameraId;
+        await applySelectedCamera(desiredCameraId);
+        return;
+      }
+      if (state.cameras.length) {
+        els.cameraSelect.value = state.cameras[0].camera_id;
+        await applySelectedCamera(state.cameras[0].camera_id);
+        return;
+      }
+      newCamera();
+    }
+
+    async function loadFloorPlans() {
+      const r = await fetch('/api/floor-plans');
+      if (!r.ok) throw new Error('failed to load floor plans');
+      const body = await r.json();
+      state.floorPlans = body.floor_plans || [];
+      els.planSelect.innerHTML = '';
+      state.floorPlans.forEach((name) => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        els.planSelect.appendChild(opt);
+      });
+      if (els.planSelect.value) {
+        await loadFloorPlanImage(els.planSelect.value);
+      }
+    }
+
+    async function loadFloorPlanImage(name) {
+      if (!name) return;
+      const r = await fetch(`/api/floor-plan/${encodeURIComponent(name)}`);
+      if (!r.ok) throw new Error('failed to load floor plan image');
+      const blob = await r.blob();
+      els.planImg.src = URL.createObjectURL(blob);
+      await new Promise((resolve) => { els.planImg.onload = () => resolve(); });
+      redraw();
+    }
+
+    async function applySelectedCamera(cameraId = '') {
+      const normalizedCameraId = String(cameraId || '').trim();
+      if (!normalizedCameraId || !state.cameraMetaById[normalizedCameraId]) {
+        newCamera();
+        return;
+      }
+      resetChessboardSources();
+      const meta = state.cameraMetaById[normalizedCameraId];
+      setCameraConfig(cameraConfigFromMeta(meta));
+      state.cameraPoints = [];
+      state.planPoints = [];
+      state.reprojected = [];
+      state.reprojError = null;
+      state.inliers = 0;
+      state.matrix = meta.homography_ground || meta.homography_matrix || null;
+      state.coveragePolygon = (meta.coverage_polygon || []).map((point) => ({ x: Number(point[0]), y: Number(point[1]) }));
+      const floorPlanName = String(meta.floor_plan_image || '');
+      if (floorPlanName && state.floorPlans.includes(floorPlanName)) {
+        els.planSelect.value = floorPlanName;
+        await loadFloorPlanImage(floorPlanName);
+      }
+      setStatus(`camera loaded: ${normalizedCameraId}`, 'good');
+      redraw();
+    }
+
+    function newCamera() {
+      els.cameraSelect.value = '';
+      resetChessboardSources();
+      state.cameraPoints = [];
+      state.planPoints = [];
+      state.coveragePolygon = [];
+      state.reprojected = [];
+      state.reprojError = null;
+      state.inliers = 0;
+      state.matrix = null;
+      setCameraConfig(blankCameraConfig(''));
+      setStatus('new camera draft ready', 'warn');
+      redraw();
+    }
+
+    async function loadReadiness() {
+      const r = await fetch('/api/readiness');
+      if (!r.ok) throw new Error('failed to load readiness');
+      const body = await r.json();
+      const cls = body.site_spatial_ready ? 'good' : (body.single_camera_ready_count > 0 ? 'warn' : 'bad');
+      setReadiness(
+        `readiness: site=${body.site_spatial_ready ? 'ready' : 'not-ready'} | single=${body.single_camera_ready_count}/${body.total_cameras} | multicam=${body.multicam_ready_count}/${body.total_cameras}`,
+        cls,
+      );
+    }
+
+    async function requestCameraFrameBlob({ applyUndistort = false } = {}) {
+      const cfg = currentCameraConfig(true);
+      const payload = {
+        camera_id: String(cfg.camera_id || '').trim() || null,
+        rtsp_url: String(cfg.rtsp_url || '').trim() || null,
+        frame_width: (cfg.frame_width == null || cfg.frame_width === '' ? null : Number(cfg.frame_width)),
+        frame_height: (cfg.frame_height == null || cfg.frame_height === '' ? null : Number(cfg.frame_height)),
+        intrinsic_matrix: cfg.intrinsic_matrix || null,
+        distortion_coefficients: cfg.distortion_coefficients || null,
+        apply_undistort: Boolean(applyUndistort),
+        undistort_alpha: 0.0,
+      };
+      if (!payload.camera_id && !payload.rtsp_url) {
+        throw new Error('camera_id or rtsp_url is required to capture a frame');
+      }
+      if (applyUndistort && (!payload.intrinsic_matrix || !payload.distortion_coefficients)) {
+        throw new Error('intrinsic_matrix and distortion_coefficients are required for undistorted capture');
+      }
+      setStatus(applyUndistort ? 'capturing undistorted frame...' : 'capturing frame...', 'warn');
+      const r = await fetch('/api/camera/frame', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        throw new Error(await r.text());
+      }
+      return await r.blob();
+    }
+
+    async function setCameraFrameFromBlob(blob, { applyUndistort = false } = {}) {
+      if (state.cameraFrameObjectUrl) {
+        URL.revokeObjectURL(state.cameraFrameObjectUrl);
+      }
+      state.cameraFrameObjectUrl = URL.createObjectURL(blob);
+      els.cameraImg.src = state.cameraFrameObjectUrl;
+      await new Promise((resolve) => { els.cameraImg.onload = () => resolve(); });
+      const nextCfg = currentCameraConfig(true);
+      if (!nextCfg.frame_width) nextCfg.frame_width = Number(els.cameraImg.naturalWidth || state.configMeta?.camera_frame_width || 0) || null;
+      if (!nextCfg.frame_height) nextCfg.frame_height = Number(els.cameraImg.naturalHeight || state.configMeta?.camera_frame_height || 0) || null;
+      setCameraConfig(nextCfg);
+      setStatus(
+        `${applyUndistort ? 'undistorted' : 'frame'} captured: ${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight}`,
+        'good',
+      );
+      redraw();
+    }
+
+    async function captureFrame({ applyUndistort = false } = {}) {
+      const blob = await requestCameraFrameBlob({ applyUndistort });
+      await setCameraFrameFromBlob(blob, { applyUndistort });
+    }
+
+    async function captureChessboardFrame() {
+      const blob = await requestCameraFrameBlob({ applyUndistort: false });
+      const captureIdx = state.chessboardCaptures.length + 1;
+      const capture = {
+        name: buildCaptureFilename('chessboard', captureIdx, blob.type),
+        blob,
+        url: URL.createObjectURL(blob),
+      };
+      state.chessboardCaptures.push(capture);
+      renderChessboardCaptureStrip();
+      updateButtons();
+      setStatus(`chessboard frame captured: ${capture.name} | total=${state.chessboardCaptures.length}`, 'good');
+    }
+
+    async function computeHomography() {
+      const pairCount = Math.min(state.cameraPoints.length, state.planPoints.length);
+      if (pairCount < 4 || state.cameraPoints.length !== state.planPoints.length) {
+        throw new Error('need at least 4 paired points and equal counts on both canvases');
+      }
+      setStatus('computing homography...', 'warn');
+      const r = await fetch('/api/compute-homography', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          src_points: state.cameraPoints.map((point) => [point.x, point.y]),
+          dst_points: state.planPoints.map((point) => [point.x, point.y]),
+        }),
+      });
+      if (!r.ok) {
+        throw new Error(await r.text());
+      }
+      const body = await r.json();
+      state.matrix = body.matrix || null;
+      state.reprojected = (body.reprojected_points || []).map((point) => ({ x: Number(point[0]), y: Number(point[1]) }));
+      state.reprojError = Number(body.reprojection_error_px || 0);
+      state.inliers = Number(body.inliers || 0);
+      const estimator = String(body.estimator || 'RANSAC');
+      const cfg = currentCameraConfig(true);
+      cfg.matrix = state.matrix;
+      cfg.matrix_ground = state.matrix;
+      setCameraConfig(cfg);
+      setStatus(
+        `homography ok | ${estimator} | error=${state.reprojError.toFixed(3)} px | inliers=${state.inliers}`,
+        'good',
+      );
+      redraw();
+    }
+
+    async function calibrateDistortion() {
+      const uploadedFiles = Array.from(els.chessboardUploadInput.files || []);
+      const capturedFiles = state.chessboardCaptures;
+      const totalFiles = uploadedFiles.length + capturedFiles.length;
+      if (!totalFiles) {
+        throw new Error('select or capture multiple chessboard images first');
+      }
+      const cols = Number(els.chessboardColsInput.value || 0);
+      const rows = Number(els.chessboardRowsInput.value || 0);
+      const squareSize = Number(els.chessboardSquareInput.value || 0);
+      if (!Number.isFinite(cols) || cols < 2 || !Number.isFinite(rows) || rows < 2) {
+        throw new Error('invalid chessboard pattern size');
+      }
+      if (!Number.isFinite(squareSize) || squareSize <= 0) {
+        throw new Error('square size must be positive');
+      }
+      const form = new FormData();
+      form.append('pattern_cols', String(Math.round(cols)));
+      form.append('pattern_rows', String(Math.round(rows)));
+      form.append('square_size', String(squareSize));
+      uploadedFiles.forEach((file) => form.append('files', file));
+      capturedFiles.forEach((capture) => form.append('files', capture.blob, capture.name));
+      setStatus(`calibrating distortion from ${totalFiles} images...`, 'warn');
+      const r = await fetch('/api/distortion/calibrate', {
+        method: 'POST',
+        body: form,
+      });
+      if (!r.ok) {
+        throw new Error(await r.text());
+      }
+      const body = await r.json();
+      const cfg = currentCameraConfig(false) || blankCameraConfig(els.cameraSelect.value || '');
+      cfg.intrinsic_matrix = body.intrinsic_matrix || null;
+      cfg.distortion_coefficients = body.distortion_coefficients || null;
+      cfg.distortion_correction_mode = 'frame_preprocess';
+      cfg.frame_width = Number(body.image_width || cfg.frame_width || 0) || null;
+      cfg.frame_height = Number(body.image_height || cfg.frame_height || 0) || null;
+      setCameraConfig(cfg);
+      setStatus(
+        `distortion ok | rms=${Number(body.rms_reprojection_error || 0).toFixed(4)} | valid=${body.valid_image_count} rejected=${body.rejected_image_count}`,
+        'good',
+      );
+    }
+
+    async function saveCameraConfig() {
+      const cfg = currentCameraConfig(true);
+      const cameraId = String(cfg.camera_id || '').trim();
+      if (!cameraId) {
+        throw new Error('camera_id is required');
+      }
+      const floorPlanFilename = String(els.planSelect.value || cfg.floor_plan_filename || '').trim();
+      if (!floorPlanFilename) {
+        throw new Error('floor plan must be selected');
+      }
+      const matrix = cfg.matrix || cfg.matrix_ground || state.matrix || null;
+      const payload = {
+        camera_id: cameraId,
+        rtsp_url: (cfg.rtsp_url === '' ? '' : (cfg.rtsp_url || null)),
+        anchor_point: String(cfg.anchor_point || 'bottom_center'),
+        floor_plan_filename: floorPlanFilename,
+        frame_width: (cfg.frame_width == null || cfg.frame_width === '' ? null : Number(cfg.frame_width)),
+        frame_height: (cfg.frame_height == null || cfg.frame_height === '' ? null : Number(cfg.frame_height)),
+        matrix,
+        matrix_ground: cfg.matrix_ground || matrix,
+        matrix_hip: cfg.matrix_hip || null,
+        matrix_head: cfg.matrix_head || null,
+        intrinsic_matrix: cfg.intrinsic_matrix || null,
+        distortion_coefficients: cfg.distortion_coefficients || null,
+        distortion_correction_mode: String(cfg.distortion_correction_mode || 'point'),
+        coverage_polygon: state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]),
+      };
+      setStatus(`saving ${cameraId}...`, 'warn');
+      const r = await fetch('/api/save', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        throw new Error(await r.text());
+      }
+      const body = await r.json();
+      await loadConfig();
+      await loadCameras();
+      await loadReadiness();
+      els.cameraSelect.value = cameraId;
+      await applySelectedCamera(cameraId);
+      setStatus(
+        `camera saved: ${cameraId} | planes=${Object.entries(body.saved_planes || {}).filter((item) => item[1]).map((item) => item[0]).join(',') || 'none'}`,
+        'good',
+      );
+    }
+
+    async function saveSiteConfig() {
+      const cfg = currentSiteConfig(true);
+      setStatus('saving site settings...', 'warn');
+      const r = await fetch('/api/save-site', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!r.ok) {
+        throw new Error(await r.text());
+      }
+      await loadConfig();
+      await loadReadiness();
+      setStatus('site settings saved', 'good');
+    }
+
+    async function uploadFloorPlan(file) {
+      if (!file) return;
+      setStatus(`uploading ${file.name}...`, 'warn');
+      const form = new FormData();
+      form.append('file', file);
+      const r = await fetch('/api/upload-floor-plan', { method: 'POST', body: form });
+      if (!r.ok) {
+        throw new Error(await r.text());
+      }
+      const body = await r.json();
+      await loadFloorPlans();
+      if (body.filename && state.floorPlans.includes(body.filename)) {
+        els.planSelect.value = body.filename;
+        await loadFloorPlanImage(body.filename);
+      }
+      const cfg = currentCameraConfig(false) || blankCameraConfig('');
+      cfg.floor_plan_filename = String(body.filename || cfg.floor_plan_filename || '');
+      setCameraConfig(cfg);
+      setStatus(`floor plan uploaded: ${body.filename}`, 'good');
+      redraw();
+    }
+
+    function bind() {
+      wireCanvas(els.cameraCanvas, els.cameraImg, 'cameraPoints');
+      wireCanvas(els.planCanvas, els.planImg, 'planPoints');
+      els.cameraSelect.addEventListener('change', async () => {
+        try {
+          await applySelectedCamera(els.cameraSelect.value);
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.newCameraBtn.addEventListener('click', () => newCamera());
+      els.captureBtn.addEventListener('click', async () => {
+        try {
+          await captureFrame();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.captureUndistortedBtn.addEventListener('click', async () => {
+        try {
+          await captureFrame({ applyUndistort: true });
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.captureChessboardBtn.addEventListener('click', async () => {
+        try {
+          await captureChessboardFrame();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.resetChessboardBtn.addEventListener('click', () => {
+        resetChessboardSources();
+        setStatus('chessboard capture set cleared', 'warn');
+      });
+      els.calibrateDistortionBtn.addEventListener('click', async () => {
+        try {
+          await calibrateDistortion();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.chessboardUploadInput.addEventListener('change', () => updateButtons());
+      els.planSelect.addEventListener('change', async () => {
+        try {
+          const planName = String(els.planSelect.value || '');
+          if (planName) {
+            await loadFloorPlanImage(planName);
+          }
+          const cfg = currentCameraConfig(false);
+          if (cfg) {
+            cfg.floor_plan_filename = planName;
+            setCameraConfig(cfg);
+          }
+          redraw();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.uploadInput.addEventListener('change', async () => {
+        try {
+          const file = els.uploadInput.files && els.uploadInput.files[0];
+          await uploadFloorPlan(file);
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        } finally {
+          els.uploadInput.value = '';
+        }
+      });
+      els.computeBtn.addEventListener('click', async () => {
+        try {
+          await computeHomography();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.saveBtn.addEventListener('click', async () => {
+        try {
+          await saveCameraConfig();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.saveSiteBtn.addEventListener('click', async () => {
+        try {
+          await saveSiteConfig();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.clearBtn.addEventListener('click', () => {
+        state.cameraPoints = [];
+        state.planPoints = [];
+        state.reprojected = [];
+        state.reprojError = null;
+        state.inliers = 0;
+        setStatus('paired points cleared', 'warn');
+        redraw();
+      });
+      els.coverageModeBtn.addEventListener('click', () => {
+        setCoverageMode(!state.coverageMode);
+      });
+      els.clearCoverageBtn.addEventListener('click', () => {
+        state.coveragePolygon = [];
+        syncCoverageIntoEditor();
+        setStatus('coverage polygon cleared', 'warn');
+        redraw();
+      });
+      els.cameraConfigEditor.addEventListener('input', () => updateButtons());
+      els.siteConfigEditor.addEventListener('input', () => updateButtons());
+      els.cameraImg.addEventListener('load', () => redraw());
+      els.planImg.addEventListener('load', () => redraw());
+      window.addEventListener('resize', () => redraw());
+    }
+
+    async function init() {
+      bind();
+      setCoverageMode(false);
+      renderChessboardCaptureStrip();
+      await loadFloorPlans();
+      await loadConfig();
+      await loadCameras();
+      await loadReadiness();
+      setStatus('ready', 'good');
+      redraw();
+    }
+
+    init().catch((e) => {
+      setStatus(String(e.message || e), 'bad');
+    });
+  </script>
+</body>
+</html>

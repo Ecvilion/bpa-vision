@@ -4,11 +4,13 @@ Real-time multi-camera pose detection pipeline built on NVIDIA DeepStream SDK.
 
 ## Architecture
 
-RTSP cameras → DeepStream (nvstreammux → nvinfer/YOLO26-pose → nvdsosd → tiler) → MP4 recording + TCP live stream + JSONL observations.
+RTSP cameras → DeepStream (nvdewarper [optional] → nvstreammux → nvinfer/YOLO26-pose → nvdsosd → tiler) → MP4 recording + TCP live stream + JSONL observations.
+
+Working resolution: 2560x1440. All output coordinates are in normalized [0,1] space.
 
 ## Prerequisites
 
-- NVIDIA GPU with driver ≥ 535
+- NVIDIA GPU with driver >= 535
 - Docker with NVIDIA Container Toolkit (`nvidia-docker`)
 - YOLO26m-pose ONNX model in `models/yolo26m-pose.onnx`
 
@@ -34,6 +36,7 @@ RTSP cameras → DeepStream (nvstreammux → nvinfer/YOLO26-pose → nvdsosd →
            --output-dir /app/output
            --conf-threshold 0.25
            --stream-port 5555
+           --calibration-dir /app/configs
    ```
 
 3. **Run:**
@@ -68,6 +71,21 @@ RTSP cameras → DeepStream (nvstreammux → nvinfer/YOLO26-pose → nvdsosd →
 | `--stream-port` | `0` | TCP stream port (`0` = disabled) |
 | `--segment-duration` | `60` | MP4 segment length in seconds |
 | `--record-duration` | `0` | Stop pipeline after N seconds (`0` = unlimited) |
+| `--calibration-dir` | — | Dir with `calibration_<cam_id>.yaml` for GPU undistortion |
+
+## Undistortion
+
+If `--calibration-dir` is set and a file `calibration_<camera_id>.yaml` exists with `intrinsic_matrix` and `distortion_coefficients`, the pipeline inserts an `nvdewarper` element per source for GPU-accelerated lens distortion correction. If no calibration is found, the source passes through without overhead.
+
+## Calibration Tool
+
+Debug utility for camera calibration (distortion + homography). Not required at runtime.
+
+```bash
+pip install fastapi uvicorn opencv-python pyyaml
+python -m tools.calibration --configs-dir configs --sources-file configs/sources.local.json
+# Open http://localhost:8098
+```
 
 ## Outputs
 

@@ -1,20 +1,20 @@
-"""DeepStream Python pipeline for BPA Vision Stage 1.
+"""DeepStream Python pipeline for BPA Vision.
 
-Pipeline (per frame):
+Pipeline (per source):
   rtspsrc → depay → queue → parse → nvv4l2decoder → queue →
+  [nvdewarper → queue] (optional, if calibration present) →
   nvstreammux(batch=1) → queue → nvinfer (pose) → queue →
   nvvideoconvert → queue → nvdsosd → queue →
   nvmultistreamtiler → queue → tee
-    ├→ queue → nvvideoconvert → queue → capsfilter → queue →
-    │  nvv4l2h264enc → queue → h264parse → splitmuxsink
-    └→ queue → nvvideoconvert → queue → capsfilter → queue →
-       nvv4l2h264enc → queue → h264parse → queue →
-       matroskamux → tcpserversink
+    ├→ queue → nvvideoconvert → capsfilter → nvv4l2h264enc →
+    │  h264parse → splitmuxsink
+    └→ queue → nvvideoconvert → capsfilter → nvv4l2h264enc →
+       h264parse → matroskamux → tcpserversink
 
 Python probe on nvinfer src pad:
-  1. Parse output tensors → FrameObservation
+  1. Parse output tensors → PoseDetection (pixel-space)
   2. Attach bbox/keypoints as OSD display meta
-  3. Write JSONL records
+  3. Convert to normalized [0,1] and write JSONL records
 
 Usage:
   python3 deepstream/pipeline.py --sources-file configs/sources.json
@@ -30,6 +30,7 @@ from pathlib import Path
 from urllib.parse import quote, urlparse, urlunparse
 from uuid import uuid4
 
+import yaml
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -43,12 +44,13 @@ from yolo26_parser import (
     parse_pose_tensor,
     detections_to_normalized,
 )
+from dewarper import render_dewarper_config
 
 logger = logging.getLogger("bpa_vision.pipeline")
 
 # ── Constants ──────────────────────────────────────────────────────────────
-MUXER_WIDTH = 1920
-MUXER_HEIGHT = 1080
+MUXER_WIDTH = 2560
+MUXER_HEIGHT = 1440
 MUXER_BATCH_TIMEOUT = 40000  # μs
 GPU_ID = 0
 
@@ -81,6 +83,26 @@ def make_queue(name: str) -> Gst.Element:
     return q
 
 
+def _load_calibration(calibration_dir: str, camera_id: str) -> dict | None:
+    """Load calibration YAML for a camera, or return None if not found."""
+    cal_dir = Path(calibration_dir)
+    cal_path = cal_dir / f"calibration_{camera_id}.yaml"
+    if not cal_path.exists():
+        return None
+    try:
+        with open(cal_path, "r", encoding="utf-8") as f:
+            cal = yaml.safe_load(f)
+        if (
+            isinstance(cal, dict)
+            and cal.get("intrinsic_matrix")
+            and cal.get("distortion_coefficients")
+        ):
+            return cal
+    except Exception as e:
+        logger.warning("Failed to load calibration %s: %s", cal_path, e)
+    return None
+
+
 class PipelineManager:
     """Builds and runs the DeepStream pipeline for multiple RTSP sources."""
 
@@ -93,6 +115,7 @@ class PipelineManager:
         stream_port: int = 0,
         segment_duration: int = 60,
         record_duration: int = 0,
+        calibration_dir: str = "",
     ):
         self.sources = sources
         self.pose_config = pose_config
@@ -102,6 +125,7 @@ class PipelineManager:
         self.stream_port = stream_port  # TCP stream port, 0 = disabled
         self.segment_duration = segment_duration  # MP4 segment length in seconds
         self.record_duration = record_duration  # total recording time, 0 = unlimited
+        self.calibration_dir = calibration_dir  # dir with calibration_<cam_id>.yaml
 
         self.pipeline: Gst.Pipeline | None = None
         self.loop: GLib.MainLoop | None = None
@@ -192,7 +216,7 @@ class PipelineManager:
         )
         q_encoder = make_queue("q_encoder")
         encoder = make_element("nvv4l2h264enc", "encoder")
-        encoder.set_property("bitrate", 4000000)
+        encoder.set_property("bitrate", 8000000)
         q_h264parse = make_queue("q_h264parse")
         h264parse = make_element("h264parse", "h264parse")
         splitmux = make_element("splitmuxsink", "splitmux")
@@ -248,8 +272,9 @@ class PipelineManager:
     def _add_source_branch(
         self, idx: int, src: dict, streammux: Gst.Element
     ) -> None:
-        """Add one RTSP source → decode → queue → muxer sink pad."""
+        """Add one RTSP source → decode → [dewarper] → muxer sink pad."""
         uri = src["stream_uri"]
+        cam_id = src.get("camera_id", f"cam_{idx}")
 
         # GStreamer rtspsrc does NOT url-decode passwords in inline URIs,
         # so special characters (like !) must be percent-encoded.
@@ -282,11 +307,44 @@ class PipelineManager:
         )
         decoder.link(q_dec)
 
+        # ── Optional nvdewarper (GPU undistortion) ──
+        last_element = q_dec
+        if self.calibration_dir:
+            cal = _load_calibration(self.calibration_dir, cam_id)
+            if cal:
+                try:
+                    dw_cfg = render_dewarper_config(
+                        camera_id=cam_id,
+                        intrinsic_matrix=cal["intrinsic_matrix"],
+                        distortion_coefficients=cal["distortion_coefficients"],
+                        width=cal.get("frame_width", MUXER_WIDTH),
+                        height=cal.get("frame_height", MUXER_HEIGHT),
+                        output_dir=str(self.output_dir / "dewarper_configs"),
+                    )
+                    dewarper = make_element("nvdewarper", f"dewarper_{idx}")
+                    dewarper.set_property("config-file", dw_cfg.config_file)
+                    dewarper.set_property("gpu-id", GPU_ID)
+                    q_dw = make_queue(f"q_dewarper_{idx}")
+                    self.pipeline.add(dewarper)
+                    self.pipeline.add(q_dw)
+                    q_dec.link(dewarper)
+                    dewarper.link(q_dw)
+                    last_element = q_dw
+                    logger.info(
+                        "Source %d (%s): nvdewarper enabled (config: %s)",
+                        idx, cam_id, dw_cfg.config_file,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Source %d (%s): nvdewarper setup failed, skipping: %s",
+                        idx, cam_id, e,
+                    )
+
         # Request a sink pad on streammux
         pad_name = f"sink_{idx}"
         mux_sink = streammux.request_pad_simple(pad_name)
-        q_src_pad = q_dec.get_static_pad("src")
-        q_src_pad.link(mux_sink)
+        last_src_pad = last_element.get_static_pad("src")
+        last_src_pad.link(mux_sink)
 
     def _on_rtspsrc_pad_added_auto(
         self, rtspsrc: Gst.Element, pad: Gst.Pad, idx: int, decoder: Gst.Element
@@ -362,7 +420,7 @@ class PipelineManager:
             # Parse output tensors
             detections = self._extract_pose_detections(frame_meta)
 
-            # Convert to normalized space and write JSONL
+            # Convert to normalized [0,1] space and write JSONL
             if detections:
                 normalized = detections_to_normalized(
                     detections, MUXER_WIDTH, MUXER_HEIGHT
@@ -538,7 +596,7 @@ class PipelineManager:
 
         q_enc_stream = make_queue("q_enc_stream")
         encoder_stream = make_element("nvv4l2h264enc", "encoder_stream")
-        encoder_stream.set_property("bitrate", 4000000)
+        encoder_stream.set_property("bitrate", 8000000)
         encoder_stream.set_property("iframeinterval", 30)
         encoder_stream.set_property("profile", 4)  # high
         encoder_stream.set_property("insert-sps-pps", True)
@@ -702,6 +760,12 @@ def main():
         default=0,
         help="Stop pipeline after N seconds (0 = unlimited)",
     )
+    parser.add_argument(
+        "--calibration-dir",
+        default="",
+        help="Directory with calibration_<camera_id>.yaml files for undistortion. "
+             "If empty or file not found, undistortion is skipped.",
+    )
     args = parser.parse_args()
 
     if args.sources_file:
@@ -723,6 +787,7 @@ def main():
         stream_port=args.stream_port,
         segment_duration=args.segment_duration,
         record_duration=args.record_duration,
+        calibration_dir=args.calibration_dir,
     )
     mgr.build()
     mgr.run()
