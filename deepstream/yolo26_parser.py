@@ -51,11 +51,12 @@ class PoseDetection(Detection):
 
 
 def _get_tensor_output(
-    tensor_meta, layer_index: int = 0, expected_cols: int = 0
+    tensor_meta, layer_index: int = 0, expected_cols: int = 0,
 ) -> np.ndarray | None:
     """Extract numpy array from NvDsInferTensorMeta output layer.
 
     Uses ctypes to read the float buffer directly from the layer.
+    DeepStream attaches per-frame tensor meta with correct buffer pointer.
     """
     layer = pyds.get_nvds_LayerInfo(tensor_meta, layer_index)
     if layer is None:
@@ -65,11 +66,11 @@ def _get_tensor_output(
     num_dims = dims.numDims
     shape = [dims.d[i] for i in range(num_dims)]
 
-    total = 1
+    per_frame = 1
     for s in shape:
-        total *= s
+        per_frame *= s
 
-    if total <= 0:
+    if per_frame <= 0:
         return None
 
     # Get buffer pointer via pyds and read as ctypes float array
@@ -78,7 +79,7 @@ def _get_tensor_output(
         return None
 
     # Cast pointer to float array of correct size
-    float_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_float * total))
+    float_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_float * per_frame))
     arr = np.frombuffer(float_ptr.contents, dtype=np.float32).copy()
 
     if len(shape) > 1 and all(s > 0 for s in shape):
@@ -88,6 +89,24 @@ def _get_tensor_output(
         return arr.reshape(-1, expected_cols)
 
     return arr
+
+
+def _letterbox_params(
+    input_width: int, input_height: int, frame_width: int, frame_height: int
+) -> tuple[float, float, float]:
+    """Compute letterbox scale and padding offsets.
+
+    nvinfer with maintain-aspect-ratio=1 + symmetric-padding=1 scales the
+    frame to fit inside [input_width x input_height] keeping aspect ratio,
+    then centres it with equal padding on both sides.
+
+    Returns (scale, pad_x, pad_y) where:
+      frame_coord = (model_coord - pad) / scale
+    """
+    scale = min(input_width / frame_width, input_height / frame_height)
+    pad_x = (input_width - frame_width * scale) / 2.0
+    pad_y = (input_height - frame_height * scale) / 2.0
+    return scale, pad_x, pad_y
 
 
 def parse_detection_tensor(
@@ -111,8 +130,9 @@ def parse_detection_tensor(
         arr = arr[0]
 
     detections = []
-    scale_x = frame_width / input_width
-    scale_y = frame_height / input_height
+    scale, pad_x, pad_y = _letterbox_params(
+        input_width, input_height, frame_width, frame_height
+    )
 
     for i in range(arr.shape[0]):
         row = arr[i]
@@ -124,10 +144,10 @@ def parse_detection_tensor(
         if class_id != PERSON_CLASS_ID:
             continue
 
-        x1 = float(row[0]) * scale_x
-        y1 = float(row[1]) * scale_y
-        x2 = float(row[2]) * scale_x
-        y2 = float(row[3]) * scale_y
+        x1 = (float(row[0]) - pad_x) / scale
+        y1 = (float(row[1]) - pad_y) / scale
+        x2 = (float(row[2]) - pad_x) / scale
+        y2 = (float(row[3]) - pad_y) / scale
 
         detections.append(Detection(
             x1=x1, y1=y1, x2=x2, y2=y2,
@@ -165,9 +185,15 @@ def parse_pose_tensor(
     if arr.ndim != 2 or arr.shape[1] < 57:
         return []
 
+    # Filter out rows with NaN values (corrupted tensor data)
+    nan_mask = np.isnan(arr).any(axis=1)
+    if nan_mask.any():
+        arr = arr[~nan_mask]
+
     detections = []
-    scale_x = frame_width / input_width
-    scale_y = frame_height / input_height
+    scale, pad_x, pad_y = _letterbox_params(
+        input_width, input_height, frame_width, frame_height
+    )
 
     for i in range(arr.shape[0]):
         row = arr[i]
@@ -177,17 +203,17 @@ def parse_pose_tensor(
 
         class_id = int(row[5])
 
-        x1 = float(row[0]) * scale_x
-        y1 = float(row[1]) * scale_y
-        x2 = float(row[2]) * scale_x
-        y2 = float(row[3]) * scale_y
+        x1 = (float(row[0]) - pad_x) / scale
+        y1 = (float(row[1]) - pad_y) / scale
+        x2 = (float(row[2]) - pad_x) / scale
+        y2 = (float(row[3]) - pad_y) / scale
 
         # Parse 17 keypoints starting at index 6
         keypoints = []
         for k in range(NUM_KEYPOINTS):
             base = 6 + k * 3
-            kp_x = float(row[base]) * scale_x
-            kp_y = float(row[base + 1]) * scale_y
+            kp_x = (float(row[base]) - pad_x) / scale
+            kp_y = (float(row[base + 1]) - pad_y) / scale
             kp_c = float(row[base + 2])
             keypoints.append((kp_x, kp_y, kp_c))
 
@@ -200,6 +226,11 @@ def parse_pose_tensor(
     return detections
 
 
+def _clamp01(value: float) -> float:
+    """Clamp a value to [0, 1]."""
+    return max(0.0, min(1.0, value))
+
+
 def detections_to_normalized(
     detections: list[Detection],
     frame_width: int,
@@ -210,10 +241,10 @@ def detections_to_normalized(
     for det in detections:
         entry = {
             "bbox": {
-                "x_min": det.x1 / frame_width,
-                "y_min": det.y1 / frame_height,
-                "x_max": det.x2 / frame_width,
-                "y_max": det.y2 / frame_height,
+                "x_min": _clamp01(det.x1 / frame_width),
+                "y_min": _clamp01(det.y1 / frame_height),
+                "x_max": _clamp01(det.x2 / frame_width),
+                "y_max": _clamp01(det.y2 / frame_height),
             },
             "confidence": det.confidence,
             "class_id": det.class_id,
@@ -221,8 +252,8 @@ def detections_to_normalized(
         if isinstance(det, PoseDetection) and det.keypoints:
             entry["keypoints"] = [
                 {
-                    "x": kp[0] / frame_width,
-                    "y": kp[1] / frame_height,
+                    "x": _clamp01(kp[0] / frame_width),
+                    "y": _clamp01(kp[1] / frame_height),
                     "confidence": kp[2],
                 }
                 for kp in det.keypoints

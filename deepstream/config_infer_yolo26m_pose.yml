@@ -2,8 +2,9 @@ property:
   gpu-id: 0
   net-scale-factor: 0.00392156862745098  # 1/255
   onnx-file: /app/models/yolo26m-pose.onnx
-  model-engine-file: /app/models/yolo26m-pose.onnx_b2_gpu0_fp16.engine
-  batch-size: 2
+  # Engine is auto-generated from ONNX on first run and cached in models/
+  model-engine-file: /app/models/yolo26m-pose.onnx_b1_gpu0_fp16.engine
+  batch-size: 1
   process-mode: 1  # primary
   model-color-format: 0  # RGB
   network-mode: 2  # FP16

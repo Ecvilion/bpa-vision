@@ -23,3 +23,7 @@ models/*.pt
 
 # Temp
 *.pt
+
+# Local overrides with credentials
+docker-compose.override.yml
+configs/sources.local.json

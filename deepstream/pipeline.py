@@ -1,19 +1,23 @@
 """DeepStream Python pipeline for BPA Vision Stage 1.
 
-Pipeline per camera:
-  rtspsrc → rtph264/5depay → nvv4l2decoder → queue →
-  nvstreammux → queue → nvinfer (pose) → queue →
+Pipeline (per frame):
+  rtspsrc → depay → queue → parse → nvv4l2decoder → queue →
+  nvstreammux(batch=1) → queue → nvinfer (pose) → queue →
   nvvideoconvert → queue → nvdsosd → queue →
-  tee → queue → filesink (encoded H264)
-      └→ queue → fakesink
+  nvmultistreamtiler → queue → tee
+    ├→ queue → nvvideoconvert → queue → capsfilter → queue →
+    │  nvv4l2h264enc → queue → h264parse → splitmuxsink
+    └→ queue → nvvideoconvert → queue → capsfilter → queue →
+       nvv4l2h264enc → queue → h264parse → queue →
+       matroskamux → tcpserversink
 
-Python probes on nvinfer src pad:
+Python probe on nvinfer src pad:
   1. Parse output tensors → FrameObservation
   2. Attach bbox/keypoints as OSD display meta
   3. Write JSONL records
 
 Usage:
-  python3 deepstream/pipeline.py --config configs/example.yaml
+  python3 deepstream/pipeline.py --sources-file configs/sources.json
 """
 
 from __future__ import annotations
@@ -21,9 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse, urlunparse
@@ -32,8 +33,7 @@ from uuid import uuid4
 import gi
 
 gi.require_version("Gst", "1.0")
-gi.require_version("GstRtspServer", "1.0")
-from gi.repository import GLib, Gst, GstRtspServer
+from gi.repository import GLib, Gst
 
 import pyds
 
@@ -90,14 +90,18 @@ class PipelineManager:
         pose_config: str,
         output_dir: str = "/app/output",
         conf_threshold: float = 0.25,
-        rtsp_out_port: int = 0,
+        stream_port: int = 0,
+        segment_duration: int = 60,
+        record_duration: int = 0,
     ):
         self.sources = sources
         self.pose_config = pose_config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.conf_threshold = conf_threshold
-        self.rtsp_out_port = rtsp_out_port  # 0 = disabled
+        self.stream_port = stream_port  # TCP stream port, 0 = disabled
+        self.segment_duration = segment_duration  # MP4 segment length in seconds
+        self.record_duration = record_duration  # total recording time, 0 = unlimited
 
         self.pipeline: Gst.Pipeline | None = None
         self.loop: GLib.MainLoop | None = None
@@ -112,7 +116,7 @@ class PipelineManager:
 
         # ── Streammux ──
         streammux = make_element("nvstreammux", "muxer")
-        streammux.set_property("batch-size", len(self.sources))
+        streammux.set_property("batch-size", 1)
         streammux.set_property("width", MUXER_WIDTH)
         streammux.set_property("height", MUXER_HEIGHT)
         streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT)
@@ -158,42 +162,64 @@ class PipelineManager:
         q_conv.link(osd)
         osd.link(q_osd)
 
+        # ── nvmultistreamtiler (all cameras side by side) ──
+        num_src = len(self.sources)
+        tiler = make_element("nvmultistreamtiler", "tiler")
+        tiler.set_property("rows", 1)
+        tiler.set_property("columns", num_src)
+        tiler.set_property("width", MUXER_WIDTH)
+        tiler.set_property("height", MUXER_HEIGHT)
+        tiler.set_property("gpu-id", GPU_ID)
+        self.pipeline.add(tiler)
+        q_tiler = make_queue("q_after_tiler")
+        self.pipeline.add(q_tiler)
+        q_osd.link(tiler)
+        tiler.link(q_tiler)
+
         # ── tee ──
         tee = make_element("tee", "tee")
         self.pipeline.add(tee)
-        q_osd.link(tee)
+        q_tiler.link(tee)
 
-        # ── Branch 1: encode → filesink ──
+        # ── Branch 1: encode → splitmuxsink (MP4 recording) ──
         q_enc = make_queue("q_encode")
         nvvidconv_enc = make_element("nvvideoconvert", "nvvidconv_enc")
         nvvidconv_enc.set_property("gpu-id", GPU_ID)
+        q_caps_enc = make_queue("q_caps_enc")
         capsfilter = make_element("capsfilter", "caps_enc")
         capsfilter.set_property(
             "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
         )
+        q_encoder = make_queue("q_encoder")
         encoder = make_element("nvv4l2h264enc", "encoder")
         encoder.set_property("bitrate", 4000000)
+        q_h264parse = make_queue("q_h264parse")
         h264parse = make_element("h264parse", "h264parse")
         splitmux = make_element("splitmuxsink", "splitmux")
         splitmux.set_property(
-            "location",
-            str(self.output_dir / "output_%02d.mp4"),
+            "location", str(self.output_dir / "output_%02d.mp4"),
         )
-        splitmux.set_property("max-size-time", 60 * Gst.SECOND)  # 60s segments
+        splitmux.set_property("max-size-time", self.segment_duration * Gst.SECOND)
 
-        for el in [q_enc, nvvidconv_enc, capsfilter, encoder, h264parse, splitmux]:
+        for el in [
+            q_enc, nvvidconv_enc, q_caps_enc, capsfilter,
+            q_encoder, encoder, q_h264parse, h264parse, splitmux,
+        ]:
             self.pipeline.add(el)
 
         tee.link(q_enc)
         q_enc.link(nvvidconv_enc)
-        nvvidconv_enc.link(capsfilter)
-        capsfilter.link(encoder)
-        encoder.link(h264parse)
+        nvvidconv_enc.link(q_caps_enc)
+        q_caps_enc.link(capsfilter)
+        capsfilter.link(q_encoder)
+        q_encoder.link(encoder)
+        encoder.link(q_h264parse)
+        q_h264parse.link(h264parse)
         h264parse.link(splitmux)
 
-        # ── Branch 2: RTSP output server or fakesink ──
-        if self.rtsp_out_port > 0:
-            self._add_rtsp_server_branch(tee)
+        # ── Branch 2: TCP stream or fakesink ──
+        if self.stream_port > 0:
+            self._add_stream_branch(tee)
         else:
             q_fake = make_queue("q_fake")
             fakesink = make_element("fakesink", "fakesink")
@@ -243,7 +269,6 @@ class PipelineManager:
         # Force TCP to avoid UDP firewall issues
         rtspsrc.set_property("protocols", 4)  # GST_RTSP_LOWER_TRANS_TCP
 
-        # Use decodebin to auto-handle h264/h265/other codecs
         decoder = make_element("nvv4l2decoder", f"decoder_{idx}")
         decoder.set_property("gpu-id", GPU_ID)
         q_dec = make_queue(f"q_decode_{idx}")
@@ -294,14 +319,18 @@ class PipelineManager:
             logger.warning("Source %d: unsupported video codec %s", idx, encoding)
             return
 
+        q_depay = make_queue(f"q_depay_{idx}")
         self.pipeline.add(depay)
+        self.pipeline.add(q_depay)
         self.pipeline.add(parse)
 
         pad.link(depay.get_static_pad("sink"))
-        depay.link(parse)
+        depay.link(q_depay)
+        q_depay.link(parse)
         parse.link(decoder)
 
         depay.sync_state_with_parent()
+        q_depay.sync_state_with_parent()
         parse.sync_state_with_parent()
 
     # ── Probe callback ─────────────────────────────────────────────────
@@ -445,10 +474,10 @@ class PipelineManager:
                 rect = pyds.NvOSD_RectParams.cast(
                     display_meta.rect_params[rect_idx]
                 )
-                rect.left = int(det.x1)
-                rect.top = int(det.y1)
-                rect.width = int(det.x2 - det.x1)
-                rect.height = int(det.y2 - det.y1)
+                rect.left = max(0, int(det.x1))
+                rect.top = max(0, int(det.y1))
+                rect.width = max(1, int(det.x2 - det.x1))
+                rect.height = max(1, int(det.y2 - det.y1))
                 rect.border_width = 2
                 rect.border_color.set(0.0, 1.0, 0.0, 1.0)  # green
                 rect.has_bg_color = 0
@@ -478,10 +507,10 @@ class PipelineManager:
                     line = pyds.NvOSD_LineParams.cast(
                         display_meta.line_params[line_idx]
                     )
-                    line.x1 = int(kp_i[0])
-                    line.y1 = int(kp_i[1])
-                    line.x2 = int(kp_j[0])
-                    line.y2 = int(kp_j[1])
+                    line.x1 = max(0, int(kp_i[0]))
+                    line.y1 = max(0, int(kp_i[1]))
+                    line.x2 = max(0, int(kp_j[0]))
+                    line.y2 = max(0, int(kp_j[1]))
                     line.line_width = 2
                     line.line_color.set(0.0, 1.0, 1.0, 1.0)  # cyan
                     line_idx += 1
@@ -490,80 +519,68 @@ class PipelineManager:
         display_meta.num_lines = line_idx
         pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
-    # ── RTSP output server ────────────────────────────────────────────
+    # ── TCP streaming output ─────────────────────────────────────────
 
-    def _add_rtsp_server_branch(self, tee: Gst.Element) -> None:
-        """Add tee branch that encodes and feeds an RTSP server.
+    def _add_stream_branch(self, tee: Gst.Element) -> None:
+        """Add tee branch: encode H264 → MKV → TCP server.
 
-        Viewers connect to: rtsp://<host>:<port>/bpa-vision
+        Clients connect to: tcp://<host>:<stream_port>
         """
-        q_rtsp = make_queue("q_rtsp_out")
-        nvvidconv_rtsp = make_element("nvvideoconvert", "nvvidconv_rtsp")
-        nvvidconv_rtsp.set_property("gpu-id", GPU_ID)
+        q_stream = make_queue("q_stream_out")
+        nvvidconv_stream = make_element("nvvideoconvert", "nvvidconv_stream")
+        nvvidconv_stream.set_property("gpu-id", GPU_ID)
 
-        caps_rtsp = make_element("capsfilter", "caps_rtsp")
-        caps_rtsp.set_property(
+        q_caps_stream = make_queue("q_caps_stream")
+        caps_stream = make_element("capsfilter", "caps_stream")
+        caps_stream.set_property(
             "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
         )
 
-        encoder_rtsp = make_element("nvv4l2h264enc", "encoder_rtsp")
-        encoder_rtsp.set_property("bitrate", 4000000)
-        encoder_rtsp.set_property("iframeinterval", 30)
-        encoder_rtsp.set_property("profile", 4)  # high
+        q_enc_stream = make_queue("q_enc_stream")
+        encoder_stream = make_element("nvv4l2h264enc", "encoder_stream")
+        encoder_stream.set_property("bitrate", 4000000)
+        encoder_stream.set_property("iframeinterval", 30)
+        encoder_stream.set_property("profile", 4)  # high
+        encoder_stream.set_property("insert-sps-pps", True)
+        encoder_stream.set_property("insert-vui", True)
 
-        h264parse_rtsp = make_element("h264parse", "h264parse_rtsp")
+        q_parse_stream = make_queue("q_parse_stream")
+        h264parse_stream = make_element("h264parse", "h264parse_stream")
+        h264parse_stream.set_property("config-interval", -1)
 
-        rtppay = make_element("rtph264pay", "rtppay")
-        rtppay.set_property("pt", 96)
+        q_mux_stream = make_queue("q_mux_stream")
+        mkvmux = make_element("matroskamux", "mkvmux")
+        mkvmux.set_property("streamable", True)
 
-        # udpsink sending to localhost — RTSP server will pick it up
-        updsink_port = 5400
-        udpsink = make_element("udpsink", "udpsink_rtsp")
-        udpsink.set_property("host", "127.0.0.1")
-        udpsink.set_property("port", updsink_port)
-        udpsink.set_property("sync", 0)
-        udpsink.set_property("async", 0)
+        tcpsink = make_element("tcpserversink", "tcpsink")
+        tcpsink.set_property("host", "0.0.0.0")
+        tcpsink.set_property("port", self.stream_port)
+        tcpsink.set_property("sync", 0)
+        tcpsink.set_property("async", 0)
 
         for el in [
-            q_rtsp, nvvidconv_rtsp, caps_rtsp,
-            encoder_rtsp, h264parse_rtsp, rtppay, udpsink,
+            q_stream, nvvidconv_stream, q_caps_stream, caps_stream,
+            q_enc_stream, encoder_stream, q_parse_stream, h264parse_stream,
+            q_mux_stream, mkvmux, tcpsink,
         ]:
             self.pipeline.add(el)
 
-        tee.link(q_rtsp)
-        q_rtsp.link(nvvidconv_rtsp)
-        nvvidconv_rtsp.link(caps_rtsp)
-        caps_rtsp.link(encoder_rtsp)
-        encoder_rtsp.link(h264parse_rtsp)
-        h264parse_rtsp.link(rtppay)
-        rtppay.link(udpsink)
-
-        # Store port for RTSP server setup
-        self._udpsink_port = updsink_port
-
-    def _start_rtsp_server(self) -> None:
-        """Start GstRtspServer that serves the encoded stream."""
-        if self.rtsp_out_port <= 0:
-            return
-
-        server = GstRtspServer.RTSPServer.new()
-        server.set_service(str(self.rtsp_out_port))
-
-        factory = GstRtspServer.RTSPMediaFactory.new()
-        factory.set_launch(
-            f'( udpsrc port={self._udpsink_port} '
-            f'caps="application/x-rtp,media=video,encoding-name=H264,payload=96" '
-            f'! rtph264depay ! h264parse ! rtph264pay name=pay0 pt=96 )'
-        )
-        factory.set_shared(True)
-
-        mounts = server.get_mount_points()
-        mounts.add_factory("/bpa-vision", factory)
-        server.attach(None)
+        tee.link(q_stream)
+        q_stream.link(nvvidconv_stream)
+        nvvidconv_stream.link(q_caps_stream)
+        q_caps_stream.link(caps_stream)
+        caps_stream.link(q_enc_stream)
+        q_enc_stream.link(encoder_stream)
+        encoder_stream.link(q_parse_stream)
+        q_parse_stream.link(h264parse_stream)
+        h264parse_stream.link(q_mux_stream)
+        q_mux_stream.link(mkvmux)
+        mkvmux.link(tcpsink)
 
         logger.info(
-            "RTSP output server started at rtsp://localhost:%d/bpa-vision",
-            self.rtsp_out_port,
+            "TCP stream server on port %d — view with: "
+            "python -c \"import cv2; cap=cv2.VideoCapture('tcp://localhost:%d')\"",
+            self.stream_port, self.stream_port,
         )
 
     # ── Run ─────────────────────────────────────────────────────────────
@@ -575,9 +592,6 @@ class PipelineManager:
 
         self.loop = GLib.MainLoop()
 
-        # Start RTSP output server if enabled
-        self._start_rtsp_server()
-
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
@@ -588,12 +602,24 @@ class PipelineManager:
             logger.error("Failed to start pipeline")
             return
 
+        if self.record_duration > 0:
+            GLib.timeout_add_seconds(
+                self.record_duration, self._on_duration_reached
+            )
+            logger.info("Recording for %d seconds...", self.record_duration)
+
         try:
             self.loop.run()
         except KeyboardInterrupt:
             logger.info("Interrupted")
         finally:
             self.stop()
+
+    def _on_duration_reached(self) -> bool:
+        """Send EOS to finalize files when record duration expires."""
+        logger.info("Record duration reached, sending EOS...")
+        self.pipeline.send_event(Gst.Event.new_eos())
+        return False  # don't repeat
 
     def stop(self) -> None:
         """Clean shutdown."""
@@ -610,8 +636,13 @@ class PipelineManager:
             self.loop.quit()
         elif msg_type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            logger.error("Pipeline error: %s\n%s", err, debug)
-            self.loop.quit()
+            src_name = message.src.get_name() if message.src else "unknown"
+            # Don't kill pipeline for rtspsrc errors — camera may reconnect
+            if "rtspsrc" in src_name:
+                logger.warning("Source %s error (non-fatal): %s", src_name, err)
+            else:
+                logger.error("Pipeline error: %s\n%s", err, debug)
+                self.loop.quit()
         elif msg_type == Gst.MessageType.WARNING:
             err, debug = message.parse_warning()
             logger.warning("Pipeline warning: %s\n%s", err, debug)
@@ -653,10 +684,23 @@ def main():
         help="Detection confidence threshold",
     )
     parser.add_argument(
-        "--rtsp-out-port",
+        "--stream-port",
         type=int,
         default=0,
-        help="RTSP output server port (0 = disabled). View at rtsp://host:<port>/bpa-vision",
+        help="TCP stream server port (0 = disabled). View with: "
+             "cv2.VideoCapture('tcp://localhost:<port>')",
+    )
+    parser.add_argument(
+        "--segment-duration",
+        type=int,
+        default=60,
+        help="MP4 segment duration in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--record-duration",
+        type=int,
+        default=0,
+        help="Stop pipeline after N seconds (0 = unlimited)",
     )
     args = parser.parse_args()
 
@@ -676,7 +720,9 @@ def main():
         pose_config=args.pose_config,
         output_dir=args.output_dir,
         conf_threshold=args.conf_threshold,
-        rtsp_out_port=args.rtsp_out_port,
+        stream_port=args.stream_port,
+        segment_duration=args.segment_duration,
+        record_duration=args.record_duration,
     )
     mgr.build()
     mgr.run()

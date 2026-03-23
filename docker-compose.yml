@@ -11,19 +11,19 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    network_mode: host
+    ports:
+      - "5555:5555"
     volumes:
       - ./output:/app/output
       - ./models:/app/models
+      - ./configs:/app/configs
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
     command: >
       python3 /app/deepstream/pipeline.py
-        --sources
-          "rtsp://viewer:Pass4Camera!@192.168.50.245"
-          "rtsp://viewer:Pass4Camera!@192.168.50.243"
+        --sources-file /app/configs/sources.json
         --pose-config /app/deepstream/config_infer_yolo26m_pose.yml
         --output-dir /app/output
         --conf-threshold 0.25
-        --rtsp-out-port 8554
+        --stream-port 5555
