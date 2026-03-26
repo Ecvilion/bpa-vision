@@ -87,6 +87,16 @@ python -m tools.calibration --configs-dir configs --sources-file configs/sources
 # Open http://localhost:8098
 ```
 
+## Skeleton Visualization
+
+Pose skeleton bones on the OSD overlay are colored by body side:
+
+| Side | Color | Bones |
+|---|---|---|
+| Left | Blue | shoulder→elbow→wrist, hip→knee→ankle, eye→ear |
+| Right | Yellow | shoulder→elbow→wrist, hip→knee→ankle, eye→ear |
+| Center | Green | nose→eyes, shoulder↔shoulder, hip↔hip |
+
 ## Outputs
 
 - `output/output_00.mp4`, `output_01.mp4`, ... — tiled video segments

@@ -64,6 +64,28 @@ SKELETON_PAIRS = [
     (11, 13), (13, 15), (12, 14), (14, 16),  # legs
 ]
 
+# Bone colors by side: left (blue), right (yellow), center (green)
+# COCO: odd indices = left, even indices = right (except nose=0)
+_LEFT_COLOR = (0.4, 0.7, 1.0, 1.0)   # blue
+_RIGHT_COLOR = (1.0, 0.85, 0.2, 1.0)  # yellow
+_CENTER_COLOR = (0.0, 1.0, 0.6, 1.0)  # green
+
+# Left keypoint indices: left_eye(1), left_ear(3), left_shoulder(5),
+#   left_elbow(7), left_wrist(9), left_hip(11), left_knee(13), left_ankle(15)
+_LEFT_KP = {1, 3, 5, 7, 9, 11, 13, 15}
+# Right keypoint indices: right_eye(2), right_ear(4), right_shoulder(6),
+#   right_elbow(8), right_wrist(10), right_hip(12), right_knee(14), right_ankle(16)
+_RIGHT_KP = {2, 4, 6, 8, 10, 12, 14, 16}
+
+
+def _bone_color(i: int, j: int) -> tuple[float, float, float, float]:
+    """Return RGBA color for a skeleton bone based on left/right side."""
+    if i in _LEFT_KP and j in _LEFT_KP:
+        return _LEFT_COLOR
+    if i in _RIGHT_KP and j in _RIGHT_KP:
+        return _RIGHT_COLOR
+    return _CENTER_COLOR
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -541,7 +563,7 @@ class PipelineManager:
                 rect.has_bg_color = 0
                 rect_idx += 1
 
-            # Draw skeleton lines
+            # Draw skeleton lines (colored by left/right side)
             if isinstance(det, PoseDetection) and det.keypoints:
                 for i, j in SKELETON_PAIRS:
                     kp_i = det.keypoints[i]
@@ -570,7 +592,8 @@ class PipelineManager:
                     line.x2 = max(0, int(kp_j[0]))
                     line.y2 = max(0, int(kp_j[1]))
                     line.line_width = 2
-                    line.line_color.set(0.0, 1.0, 1.0, 1.0)  # cyan
+                    r, g, b, a = _bone_color(i, j)
+                    line.line_color.set(r, g, b, a)
                     line_idx += 1
 
         display_meta.num_rects = rect_idx

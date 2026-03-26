@@ -11,8 +11,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    ports:
-      - "5555:5555"
+    network_mode: host
     volumes:
       - ./output:/app/output
       - ./models:/app/models
@@ -22,9 +21,9 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=all
     command: >
       python3 /app/deepstream/pipeline.py
-        --sources-file /app/configs/sources.json
+        --sources-file /app/configs/sources.local.json
         --pose-config /app/deepstream/config_infer_yolo26m_pose.yml
         --output-dir /app/output
         --conf-threshold 0.25
         --stream-port 5555
-        --calibration-dir /app/configs
+        --segment-duration 60

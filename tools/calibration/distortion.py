@@ -204,9 +204,67 @@ def undistort_image(
     )
 
 
+def undistort_points(
+    points: Iterable[tuple[float, float] | list[float]],
+    *,
+    intrinsic_matrix: list[list[float]],
+    distortion_coefficients: list[float],
+    image_width: int,
+    image_height: int,
+    alpha: float = 0.0,
+) -> tuple[list[tuple[float, float]], list[list[float]], tuple[int, int, int, int]]:
+    camera_matrix = np.asarray(intrinsic_matrix, dtype=np.float64)
+    if camera_matrix.shape != (3, 3):
+        raise ValueError("intrinsic_matrix must be 3x3")
+    distortion = np.asarray(distortion_coefficients, dtype=np.float64).reshape(-1)
+    width = int(image_width)
+    height = int(image_height)
+    if width <= 0 or height <= 0:
+        raise ValueError("image_width and image_height must be positive")
+
+    point_list: list[tuple[float, float]] = []
+    for raw in points:
+        if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+            raise ValueError("Each point must be [x, y]")
+        x = float(raw[0])
+        y = float(raw[1])
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError("Point coordinates must be finite")
+        point_list.append((x, y))
+
+    new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
+        camera_matrix,
+        distortion,
+        (width, height),
+        float(alpha),
+        (width, height),
+    )
+    if not point_list:
+        x, y, roi_w, roi_h = roi
+        return (
+            [],
+            [[float(v) for v in row] for row in np.asarray(new_camera_matrix, dtype=np.float64).tolist()],
+            (int(x), int(y), int(roi_w), int(roi_h)),
+        )
+
+    pts = np.asarray(point_list, dtype=np.float64).reshape(-1, 1, 2)
+    undistorted = cv2.undistortPoints(pts, camera_matrix, distortion, P=new_camera_matrix)
+    output = [
+        (float(point[0]), float(point[1]))
+        for point in np.asarray(undistorted, dtype=np.float64).reshape(-1, 2).tolist()
+    ]
+    x, y, roi_w, roi_h = roi
+    return (
+        output,
+        [[float(v) for v in row] for row in np.asarray(new_camera_matrix, dtype=np.float64).tolist()],
+        (int(x), int(y), int(roi_w), int(roi_h)),
+    )
+
+
 __all__ = [
     "ChessboardCalibrationResult",
     "calibrate_camera_from_chessboard_images",
     "decode_image_bytes",
     "undistort_image",
+    "undistort_points",
 ]

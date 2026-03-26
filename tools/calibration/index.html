@@ -225,7 +225,8 @@
       <div class="tip">
         Fields supported here: `camera_id`, `rtsp_url`, `anchor_point`, `frame_width`, `frame_height`,
         `matrix`, `matrix_ground`, `matrix_hip`, `matrix_head`, `intrinsic_matrix`,
-        `distortion_coefficients`, `distortion_correction_mode`, `floor_plan_filename`.
+        `distortion_coefficients`, `distortion_correction_mode`, `camera_points_space`,
+        `floor_plan_filename`.
         Coverage polygon is edited on the map and synced into this JSON.
       </div>
     </div>
@@ -327,6 +328,10 @@
       els.coverageModeBtn.className = state.coverageMode ? 'warn' : '';
     }
 
+    function normalizeCameraPointSpace(value) {
+      return String(value || 'raw') === 'undistorted' ? 'undistorted' : 'raw';
+    }
+
     function clonePoint(point) {
       if (!point) return null;
       return { x: Number(point.x), y: Number(point.y) };
@@ -380,13 +385,29 @@
       state.inlierMask = [];
     }
 
-    function syncCalibrationStateIntoEditor({ includeCoverage = true, includeHomography = false } = {}) {
+    function clearComputedHomographyInConfig(cfg) {
+      cfg.matrix = null;
+      cfg.matrix_ground = null;
+      cfg.matrix_hip = null;
+      cfg.matrix_head = null;
+      cfg.homography_stats = null;
+    }
+
+    function syncCalibrationStateIntoEditor({
+      includeCoverage = true,
+      includeHomography = false,
+      clearHomography = false,
+    } = {}) {
       const cfg = currentCameraConfig(false);
       if (!cfg) return;
       cfg.point_pairs = serializePointPairs();
+      cfg.camera_points_space = normalizeCameraPointSpace(cfg.camera_points_space);
       if (includeCoverage) {
         cfg.coverage_polygon = state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]);
         cfg.floor_plan_filename = String(els.planSelect.value || cfg.floor_plan_filename || '');
+      }
+      if (clearHomography) {
+        clearComputedHomographyInConfig(cfg);
       }
       if (includeHomography) {
         cfg.matrix = state.matrix || cfg.matrix || null;
@@ -563,6 +584,7 @@
         camera_id: String(cameraId || '').trim(),
         rtsp_url: '',
         anchor_point: 'bottom_center',
+        camera_points_space: 'raw',
         floor_plan_filename: String(els.planSelect.value || ''),
         frame_width: Number(state.configMeta?.camera_frame_width || 0) || null,
         frame_height: Number(state.configMeta?.camera_frame_height || 0) || null,
@@ -584,6 +606,7 @@
         camera_id: String(meta.camera_id || ''),
         rtsp_url: String(meta.rtsp_url || ''),
         anchor_point: String(meta.anchor_point || 'bottom_center'),
+        camera_points_space: normalizeCameraPointSpace(meta.camera_points_space || 'raw'),
         floor_plan_filename: String(meta.floor_plan_image || els.planSelect.value || ''),
         frame_width: meta.frame_width ?? (Number(state.configMeta?.camera_frame_width || 0) || null),
         frame_height: meta.frame_height ?? (Number(state.configMeta?.camera_frame_height || 0) || null),
@@ -625,6 +648,7 @@
       els.cameraStageMeta.textContent = [
         cameraId || 'unsaved camera',
         cameraSize,
+        `space=${normalizeCameraPointSpace(cfg?.camera_points_space)}`,
         `points=${pointCount('camera')}`,
         `pairs=${completePairs().length}/${state.pointPairs.length}`,
       ].join(' | ');
@@ -685,6 +709,19 @@
       const sx = canvas.width / Math.max(1, nx);
       const sy = canvas.height / Math.max(1, ny);
       return { x: point.x * sx, y: point.y * sy };
+    }
+
+    function drawXMarker(ctx, point, color, size = 7, lineWidth = 1.25) {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(point.x - size, point.y - size);
+      ctx.lineTo(point.x + size, point.y + size);
+      ctx.moveTo(point.x + size, point.y - size);
+      ctx.lineTo(point.x - size, point.y + size);
+      ctx.stroke();
+      ctx.restore();
     }
 
     function drawPoints(canvas, img, points, side, color, reprojected = [], polygon = [], guides = null) {
@@ -761,11 +798,8 @@
           ctx.stroke();
         }
 
-        ctx.strokeStyle = stroke;
         ctx.fillStyle = stroke;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
-        ctx.stroke();
+        drawXMarker(ctx, p, stroke, 6.5, 1.35);
         ctx.fillText(String(idx + 1), p.x + 8, p.y - 8);
       });
     }
@@ -832,7 +866,11 @@
         } else {
           const pairIdx = addPointForSide(targetKey, point);
           resetComputedHomography();
-          syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
+          syncCalibrationStateIntoEditor({
+            includeCoverage: false,
+            includeHomography: false,
+            clearHomography: true,
+          });
           setStatus(`pair #${pairIdx + 1} updated on ${targetKey}`, 'warn');
         }
         redraw();
@@ -851,7 +889,11 @@
           } else {
             state.pointPairs.splice(idx, 1);
             resetComputedHomography();
-            syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
+            syncCalibrationStateIntoEditor({
+              includeCoverage: false,
+              includeHomography: false,
+              clearHomography: true,
+            });
             setStatus(`pair #${idx + 1} removed`, 'warn');
           }
           redraw();
@@ -886,7 +928,11 @@
         } else if (state.pointPairs[state.drag.idx]) {
           state.pointPairs[state.drag.idx][targetKey] = { x: point.x, y: point.y };
           resetComputedHomography();
-          syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
+          syncCalibrationStateIntoEditor({
+            includeCoverage: false,
+            includeHomography: false,
+            clearHomography: true,
+          });
         }
         redraw();
       });
@@ -1063,6 +1109,11 @@
       const nextCfg = currentCameraConfig(true);
       if (!nextCfg.frame_width) nextCfg.frame_width = Number(els.cameraImg.naturalWidth || state.configMeta?.camera_frame_width || 0) || null;
       if (!nextCfg.frame_height) nextCfg.frame_height = Number(els.cameraImg.naturalHeight || state.configMeta?.camera_frame_height || 0) || null;
+      if (pointCount('camera') === 0) {
+        nextCfg.camera_points_space = applyUndistort ? 'undistorted' : 'raw';
+      } else {
+        nextCfg.camera_points_space = normalizeCameraPointSpace(nextCfg.camera_points_space);
+      }
       setCameraConfig(nextCfg);
       setStatus(
         `${applyUndistort ? 'undistorted' : 'frame'} captured: ${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight}`,
@@ -1071,9 +1122,68 @@
       redraw();
     }
 
+    async function remapCameraPointsToUndistortedFrame({ alpha = 0.0 } = {}) {
+      const cfg = currentCameraConfig(true);
+      const totalCameraPoints = pointCount('camera');
+      if (totalCameraPoints < 1) return 0;
+      if (normalizeCameraPointSpace(cfg.camera_points_space) === 'undistorted') return 0;
+
+      const payload = {
+        points: state.pointPairs.map((pair) => (
+          pair.camera ? [Number(pair.camera.x), Number(pair.camera.y)] : null
+        )),
+        intrinsic_matrix: cfg.intrinsic_matrix || null,
+        distortion_coefficients: cfg.distortion_coefficients || null,
+        image_width: Number(cfg.frame_width || els.cameraImg.naturalWidth || 0),
+        image_height: Number(cfg.frame_height || els.cameraImg.naturalHeight || 0),
+        alpha: Number(alpha || 0),
+      };
+      if (!payload.intrinsic_matrix || !payload.distortion_coefficients) {
+        throw new Error('intrinsic_matrix and distortion_coefficients are required to remap points');
+      }
+      if (!(payload.image_width > 0 && payload.image_height > 0)) {
+        throw new Error('frame_width and frame_height are required to remap points');
+      }
+
+      const response = await fetch('/api/points/undistort', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      (body.points || []).forEach((point, idx) => {
+        if (!point || !state.pointPairs[idx]) return;
+        state.pointPairs[idx].camera = { x: Number(point[0]), y: Number(point[1]) };
+      });
+      resetComputedHomography();
+      cfg.camera_points_space = 'undistorted';
+      cfg.point_pairs = serializePointPairs();
+      clearComputedHomographyInConfig(cfg);
+      setCameraConfig(cfg);
+      redraw();
+      return totalCameraPoints;
+    }
+
     async function captureFrame({ applyUndistort = false } = {}) {
       const blob = await requestCameraFrameBlob({ applyUndistort });
       await setCameraFrameFromBlob(blob, { applyUndistort });
+      if (applyUndistort) {
+        const remappedCount = await remapCameraPointsToUndistortedFrame({ alpha: 0.0 });
+        if (remappedCount > 0) {
+          setStatus(
+            `undistorted frame captured: ${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight} | remapped points=${remappedCount}`,
+            'good',
+          );
+        }
+        return;
+      }
+      const cfg = currentCameraConfig(false);
+      if (pointCount('camera') > 0 && normalizeCameraPointSpace(cfg?.camera_points_space) === 'undistorted') {
+        setStatus('raw frame captured | saved camera points are undistorted and may not align', 'warn');
+      }
     }
 
     async function captureChessboardFrame() {
@@ -1186,6 +1296,7 @@
         camera_id: cameraId,
         rtsp_url: (cfg.rtsp_url === '' ? '' : (cfg.rtsp_url || null)),
         anchor_point: String(cfg.anchor_point || 'bottom_center'),
+        camera_points_space: normalizeCameraPointSpace(cfg.camera_points_space),
         floor_plan_filename: floorPlanFilename,
         frame_width: (cfg.frame_width == null || cfg.frame_width === '' ? null : Number(cfg.frame_width)),
         frame_height: (cfg.frame_height == null || cfg.frame_height === '' ? null : Number(cfg.frame_height)),
@@ -1363,7 +1474,11 @@
       els.clearBtn.addEventListener('click', () => {
         state.pointPairs = [];
         resetComputedHomography();
-        syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: false });
+        syncCalibrationStateIntoEditor({
+          includeCoverage: false,
+          includeHomography: false,
+          clearHomography: true,
+        });
         setStatus('paired points cleared', 'warn');
         redraw();
       });

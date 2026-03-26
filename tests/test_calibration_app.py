@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 
@@ -24,6 +25,34 @@ def _runtime(tmp_path: Path) -> CalibrationRuntime:
 
 
 class TestCalibrationApi:
+    def test_undistort_points_endpoint_preserves_nulls_and_marks_space(self, tmp_path):
+        client = TestClient(create_calibration_app(_runtime(tmp_path)))
+
+        response = client.post(
+            "/api/points/undistort",
+            json={
+                "points": [[100.0, 120.0], None, [320.0, 240.0]],
+                "intrinsic_matrix": [[900.0, 0.0, 320.0], [0.0, 900.0, 240.0], [0.0, 0.0, 1.0]],
+                "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+                "image_width": 640,
+                "image_height": 480,
+                "alpha": 0.0,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["camera_points_space"] == "undistorted"
+        assert body["points"][1] is None
+        assert body["points"][0][0] == pytest.approx(100.0, abs=1e-4)
+        assert body["points"][0][1] == pytest.approx(120.0, abs=1e-4)
+        assert body["points"][2][0] == pytest.approx(320.0, abs=1e-4)
+        assert body["points"][2][1] == pytest.approx(240.0, abs=1e-4)
+        assert len(body["new_intrinsic_matrix"]) == 3
+        assert len(body["roi"]) == 4
+        assert body["roi"][2] > 0
+        assert body["roi"][3] > 0
+
     def test_compute_homography_returns_overlay_and_mask(self, tmp_path):
         client = TestClient(create_calibration_app(_runtime(tmp_path)))
 
@@ -51,6 +80,7 @@ class TestCalibrationApi:
             "camera_id": "cam-01",
             "rtsp_url": "rtsp://override/stream",
             "anchor_point": "bottom_center",
+            "camera_points_space": "undistorted",
             "floor_plan_filename": "plan.png",
             "frame_width": 2560,
             "frame_height": 1440,
@@ -90,6 +120,7 @@ class TestCalibrationApi:
         saved = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         assert saved["camera_id"] == "cam-01"
         assert saved["anchor_point"] == "bottom_center"
+        assert saved["camera_points_space"] == "undistorted"
         assert saved["homography_ground"] == payload["matrix_ground"]
         assert saved["coverage_polygon"] == payload["coverage_polygon"]
         assert saved["point_pairs"] == payload["point_pairs"]
@@ -99,6 +130,7 @@ class TestCalibrationApi:
         assert cameras_response.status_code == 200
         camera_meta = cameras_response.json()["cameras"][0]
         assert camera_meta["anchor_point"] == "bottom_center"
+        assert camera_meta["camera_points_space"] == "undistorted"
         assert camera_meta["homography_ground"] == payload["matrix_ground"]
         assert camera_meta["point_pairs"] == payload["point_pairs"]
         assert camera_meta["has_homography"] is True

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import cv2  # type: ignore
 import numpy as np
@@ -26,6 +26,7 @@ from .distortion import (
     calibrate_camera_from_chessboard_images,
     decode_image_bytes,
     undistort_image,
+    undistort_points,
 )
 from .homography import _compute_homography_impl
 from .geometry import validate_homography_matrix
@@ -151,6 +152,7 @@ class SaveCalibrationRequest(BaseModel):
     camera_id: str
     rtsp_url: str | None = None
     anchor_point: str | None = None
+    camera_points_space: Literal["raw", "undistorted"] | None = None
     matrix: list[list[float]] | None = None
     matrix_ground: list[list[float]] | None = None
     matrix_hip: list[list[float]] | None = None
@@ -180,6 +182,15 @@ class CaptureFrameRequest(BaseModel):
     distortion_coefficients: list[float] | None = None
     apply_undistort: bool = False
     undistort_alpha: float = 0.0
+
+
+class UndistortCameraPointsRequest(BaseModel):
+    points: list[list[float] | None]
+    intrinsic_matrix: list[list[float]]
+    distortion_coefficients: list[float]
+    image_width: int
+    image_height: int
+    alpha: float = 0.0
 
 
 def capture_rtsp_frame(rtsp_url: str, *, timeout_sec: float = 5.0) -> bytes:
@@ -266,6 +277,7 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
                 "has_homography": _camera_has_valid_homography(cal),
                 "rtsp_url": rtsp_url,
                 "anchor_point": cal.get("anchor_point", "bottom_center"),
+                "camera_points_space": cal.get("camera_points_space", "raw"),
                 "homography_matrix": cal.get("homography_matrix"),
                 "homography_ground": cal.get("homography_ground") or matrix,
                 "homography_hip": cal.get("homography_hip"),
@@ -343,6 +355,42 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
 
         return Response(content=jpeg, media_type="image/jpeg")
 
+    @app.post("/api/points/undistort")
+    async def undistort_camera_points(req: UndistortCameraPointsRequest) -> JSONResponse:
+        filtered_points: list[list[float]] = []
+        filtered_indices: list[int] = []
+        for idx, point in enumerate(req.points):
+            if point is None:
+                continue
+            if len(point) != 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"points[{idx}] must be [x, y] or null",
+                )
+            filtered_points.append([float(point[0]), float(point[1])])
+            filtered_indices.append(idx)
+        try:
+            mapped_points, new_intrinsic_matrix, roi = undistort_points(
+                filtered_points,
+                intrinsic_matrix=req.intrinsic_matrix,
+                distortion_coefficients=req.distortion_coefficients,
+                image_width=req.image_width,
+                image_height=req.image_height,
+                alpha=req.alpha,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        result_points: list[list[float] | None] = [None] * len(req.points)
+        for idx, point in zip(filtered_indices, mapped_points, strict=True):
+            result_points[idx] = [float(point[0]), float(point[1])]
+        return JSONResponse({
+            "points": result_points,
+            "camera_points_space": "undistorted",
+            "new_intrinsic_matrix": new_intrinsic_matrix,
+            "roi": [int(v) for v in roi],
+        })
+
     @app.post("/api/compute-homography")  # also aliased below
     async def compute_homography_endpoint(req: ComputeHomographyRequest) -> JSONResponse:
         try:
@@ -391,6 +439,8 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             cal["rtsp_url"] = req.rtsp_url
         if req.anchor_point:
             cal["anchor_point"] = req.anchor_point
+        if req.camera_points_space is not None:
+            cal["camera_points_space"] = req.camera_points_space
         if req.floor_plan_filename:
             cal["floor_plan_image"] = req.floor_plan_filename
         if req.frame_width:
