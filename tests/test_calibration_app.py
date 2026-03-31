@@ -25,6 +25,28 @@ def _runtime(tmp_path: Path) -> CalibrationRuntime:
 
 
 class TestCalibrationApi:
+    def test_line_based_distortion_endpoint_returns_model(self, tmp_path):
+        client = TestClient(create_calibration_app(_runtime(tmp_path)))
+
+        response = client.post(
+            "/api/distortion/line-based",
+            json={
+                "lines": [
+                    [[200.0, 120.0], [360.0, 140.0], [540.0, 160.0], [760.0, 185.0]],
+                    [[260.0, 520.0], [420.0, 420.0], [580.0, 320.0], [760.0, 210.0]],
+                ],
+                "image_width": 1280,
+                "image_height": 720,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["model"]["model"] == "line_based_radial_v1"
+        assert len(body["line_errors"]) == 2
+        assert body["line_count"] == 2
+        assert body["total_points"] == 8
+
     def test_undistort_points_endpoint_preserves_nulls_and_marks_space(self, tmp_path):
         client = TestClient(create_calibration_app(_runtime(tmp_path)))
 
@@ -72,6 +94,29 @@ class TestCalibrationApi:
         assert body["inliers"] == 4
         assert body["reprojection_error"] == 0.0
 
+    def test_compute_homography_accepts_runtime_ransac_parameters(self, tmp_path):
+        client = TestClient(create_calibration_app(_runtime(tmp_path)))
+
+        response = client.post(
+            "/api/compute-homography",
+            json={
+                "src_points": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+                "dst_points": [[100.0, 50.0], [140.0, 50.0], [140.0, 90.0], [100.0, 90.0]],
+                "homography_method": "all_points",
+                "ransac_reproj_threshold": 8.0,
+                "confidence": 0.995,
+                "max_iterations": 5000,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["homography_method"] == "all_points"
+        assert body["estimator"] == "ALL_POINTS"
+        assert body["ransac_reproj_threshold"] == 8.0
+        assert body["confidence"] == 0.995
+        assert body["max_iterations"] == 5000
+
     def test_save_persists_full_calibration_contract_and_readiness(self, tmp_path):
         runtime = _runtime(tmp_path)
         client = TestClient(create_calibration_app(runtime))
@@ -98,6 +143,24 @@ class TestCalibrationApi:
                 {"camera_point": [3.0, 3.0], "plan_point": [30.0, 30.0]},
                 {"camera_point": [4.0, 4.0], "plan_point": [40.0, 40.0]},
             ],
+            "line_constraints": [
+                [[100.0, 100.0], [200.0, 110.0], [300.0, 120.0]],
+                [[120.0, 240.0], [240.0, 220.0], [360.0, 200.0]],
+            ],
+            "line_based_distortion": {
+                "model": "line_based_radial_v1",
+                "k1": 0.2,
+                "center_norm": [0.5, 0.5],
+                "source_image_width": 2560,
+                "source_image_height": 1440,
+            },
+            "line_based_stats": {
+                "mean_line_error": 0.75,
+                "max_line_error": 1.25,
+                "line_errors": [0.5, 1.0],
+                "line_count": 2,
+                "total_points": 6,
+            },
             "homography_stats": {
                 "reprojection_error": 0.5,
                 "inlier_reprojection_error": 0.25,
@@ -124,6 +187,9 @@ class TestCalibrationApi:
         assert saved["homography_ground"] == payload["matrix_ground"]
         assert saved["coverage_polygon"] == payload["coverage_polygon"]
         assert saved["point_pairs"] == payload["point_pairs"]
+        assert saved["line_constraints"] == payload["line_constraints"]
+        assert saved["line_based_distortion"]["k1"] == 0.2
+        assert saved["line_based_stats"]["line_count"] == 2
         assert saved["homography_stats"]["inliers"] == 4
 
         cameras_response = client.get("/api/cameras")
@@ -133,6 +199,8 @@ class TestCalibrationApi:
         assert camera_meta["camera_points_space"] == "undistorted"
         assert camera_meta["homography_ground"] == payload["matrix_ground"]
         assert camera_meta["point_pairs"] == payload["point_pairs"]
+        assert camera_meta["line_constraints"] == payload["line_constraints"]
+        assert camera_meta["line_based_distortion"]["k1"] == 0.2
         assert camera_meta["has_homography"] is True
 
         readiness_response = client.get("/api/readiness")

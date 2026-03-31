@@ -43,9 +43,35 @@ class TestComputeHomography:
         assert len(matrix) == 3
         assert error == pytest.approx(0.0, abs=1e-4)
 
+    def test_all_points_method_uses_every_pair(self):
+        src = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [5.0, 5.0]]
+        dst = [[100.0, 50.0], [140.0, 50.0], [140.0, 90.0], [100.0, 90.0], [120.0, 70.0]]
+
+        result = _compute_homography_impl(src, dst, homography_method="all_points")
+
+        assert result.estimator == "ALL_POINTS"
+        assert result.inliers == 5
+        assert result.inlier_mask == [True, True, True, True, True]
+
     def test_rejects_duplicate_source_points(self):
         src = [[0.0, 0.0], [0.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
         dst = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
 
         with pytest.raises(ValueError, match="unique source points"):
             _compute_homography_impl(src, dst)
+
+    def test_rejects_invalid_runtime_parameters(self):
+        src = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
+        dst = [[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]]
+
+        with pytest.raises(ValueError, match="ransac_reproj_threshold"):
+            _compute_homography_impl(src, dst, ransac_reproj_threshold=0.0)
+
+        with pytest.raises(ValueError, match="confidence"):
+            _compute_homography_impl(src, dst, confidence=0.0)
+
+        with pytest.raises(ValueError, match="max_iterations"):
+            _compute_homography_impl(src, dst, max_iterations=0)
+
+        with pytest.raises(ValueError, match="Unsupported homography_method"):
+            _compute_homography_impl(src, dst, homography_method="bogus")

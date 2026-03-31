@@ -157,17 +157,36 @@
     <select id="cameraSelect"></select>
     <button id="newCameraBtn" type="button">New Camera</button>
     <button id="captureBtn">Capture Frame</button>
-    <button id="captureUndistortedBtn" type="button">Capture Undistorted</button>
+    <button id="captureUndistortedBtn" type="button">Capture Undistorted (Active)</button>
     <label>floor plan:</label>
     <select id="planSelect"></select>
     <input id="uploadInput" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp">
     <button id="computeBtn" disabled>Compute Homography</button>
     <button id="saveBtn" disabled>Save Camera Config</button>
     <button id="saveSiteBtn" disabled>Save Site Settings</button>
+    <button id="undoBtn" type="button" disabled>Undo Last Point</button>
     <button id="clearBtn" type="button">Clear Points</button>
+    <button id="projectionModeBtn" type="button">Projection Mode: Off</button>
     <button id="coverageModeBtn" type="button">Coverage Mode: Off</button>
     <button id="clearCoverageBtn" type="button">Clear Coverage</button>
     <span id="status" class="meta">loading...</span>
+  </div>
+
+  <div class="toolbar" style="border-top:0;padding-top:0;">
+    <label>homography method:</label>
+    <select id="homographyMethodSelect">
+      <option value="auto">Auto</option>
+      <option value="all_points">All Points</option>
+      <option value="ransac">RANSAC</option>
+      <option value="usac_magsac">USAC_MAGSAC</option>
+    </select>
+    <label>homography threshold:</label>
+    <input id="homographyThresholdInput" type="number" min="0.1" step="0.1" value="5.0" style="width:88px;">
+    <label>confidence:</label>
+    <input id="homographyConfidenceInput" type="number" min="0.001" max="1.0" step="0.001" value="0.999" style="width:88px;">
+    <label>max iters:</label>
+    <input id="homographyIterationsInput" type="number" min="1" step="1" value="10000" style="width:96px;">
+    <span id="homographyParamsMeta" class="meta">homography params: threshold=5.0 | confidence=0.999 | max_iters=10000</span>
   </div>
 
   <div class="toolbar" style="border-top:0;padding-top:0;">
@@ -181,6 +200,7 @@
     <button id="captureChessboardBtn" type="button">Capture Chessboard</button>
     <button id="resetChessboardBtn" type="button">Reset Chessboard Set</button>
     <button id="calibrateDistortionBtn" type="button">Calibrate Distortion</button>
+    <button id="captureBoardUndistortedBtn" type="button">Preview Board Undistort</button>
     <span id="chessboardSourceMeta" class="meta">distortion frames: upload=0 | captured=0 | total=0</span>
   </div>
 
@@ -188,6 +208,15 @@
     <div id="chessboardCaptureStrip" class="capture-strip">
       <span class="meta">Captured chessboard frames will appear here.</span>
     </div>
+  </div>
+
+  <div class="toolbar" style="border-top:0;padding-top:0;">
+    <button id="lineModeBtn" type="button">Line Mode: Off</button>
+    <button id="nextLineBtn" type="button">Next Line</button>
+    <button id="clearLinesBtn" type="button">Clear Lines</button>
+    <button id="calibrateLineBtn" type="button">Calibrate Line-Based</button>
+    <button id="captureLineUndistortedBtn" type="button">Preview Line Undistort</button>
+    <span id="lineMeta" class="meta">line constraints: lines=0 | ready=0 | points=0</span>
   </div>
 
   <div class="toolbar" style="border-top:0;padding-top:0;">
@@ -226,7 +255,7 @@
         Fields supported here: `camera_id`, `rtsp_url`, `anchor_point`, `frame_width`, `frame_height`,
         `matrix`, `matrix_ground`, `matrix_hip`, `matrix_head`, `intrinsic_matrix`,
         `distortion_coefficients`, `distortion_correction_mode`, `camera_points_space`,
-        `floor_plan_filename`.
+        `floor_plan_filename`, `line_constraints`, `line_based_distortion`, `line_based_stats`.
         Coverage polygon is edited on the map and synced into this JSON.
       </div>
     </div>
@@ -248,8 +277,14 @@
       cameraMetaById: {},
       floorPlans: [],
       pointPairs: [],
+      lineConstraints: [],
+      lineMode: false,
+      activeLineIndex: -1,
+      lineBasedStats: null,
       coveragePolygon: [],
       coverageMode: false,
+      projectionMode: false,
+      projectedPairs: [],
       reprojected: [],
       matrix: null,
       reprojError: null,
@@ -260,7 +295,15 @@
       destinationCoverage: null,
       inliers: 0,
       inlierMask: [],
-      drag: { target: null, idx: -1 },
+      homographyEstimator: null,
+      homographyParams: {
+        homography_method: 'auto',
+        ransac_reproj_threshold: 5.0,
+        confidence: 0.999,
+        max_iterations: 10000,
+      },
+      undoStack: [],
+      drag: { target: null, idx: -1, pointIdx: -1 },
       hoverGuides: {
         camera: null,
         plan: null,
@@ -274,6 +317,13 @@
       newCameraBtn: document.getElementById('newCameraBtn'),
       captureBtn: document.getElementById('captureBtn'),
       captureUndistortedBtn: document.getElementById('captureUndistortedBtn'),
+      captureBoardUndistortedBtn: document.getElementById('captureBoardUndistortedBtn'),
+      lineModeBtn: document.getElementById('lineModeBtn'),
+      nextLineBtn: document.getElementById('nextLineBtn'),
+      clearLinesBtn: document.getElementById('clearLinesBtn'),
+      calibrateLineBtn: document.getElementById('calibrateLineBtn'),
+      captureLineUndistortedBtn: document.getElementById('captureLineUndistortedBtn'),
+      lineMeta: document.getElementById('lineMeta'),
       planSelect: document.getElementById('planSelect'),
       uploadInput: document.getElementById('uploadInput'),
       chessboardColsInput: document.getElementById('chessboardColsInput'),
@@ -283,12 +333,19 @@
       captureChessboardBtn: document.getElementById('captureChessboardBtn'),
       resetChessboardBtn: document.getElementById('resetChessboardBtn'),
       calibrateDistortionBtn: document.getElementById('calibrateDistortionBtn'),
+      homographyMethodSelect: document.getElementById('homographyMethodSelect'),
+      homographyThresholdInput: document.getElementById('homographyThresholdInput'),
+      homographyConfidenceInput: document.getElementById('homographyConfidenceInput'),
+      homographyIterationsInput: document.getElementById('homographyIterationsInput'),
+      homographyParamsMeta: document.getElementById('homographyParamsMeta'),
       chessboardSourceMeta: document.getElementById('chessboardSourceMeta'),
       chessboardCaptureStrip: document.getElementById('chessboardCaptureStrip'),
       computeBtn: document.getElementById('computeBtn'),
       saveBtn: document.getElementById('saveBtn'),
       saveSiteBtn: document.getElementById('saveSiteBtn'),
+      undoBtn: document.getElementById('undoBtn'),
       clearBtn: document.getElementById('clearBtn'),
+      projectionModeBtn: document.getElementById('projectionModeBtn'),
       coverageModeBtn: document.getElementById('coverageModeBtn'),
       clearCoverageBtn: document.getElementById('clearCoverageBtn'),
       status: document.getElementById('status'),
@@ -322,14 +379,87 @@
       els.paths.textContent = text;
     }
 
+    function normalizeHomographyParameters(raw = {}) {
+      const method = String(raw.homography_method ?? 'auto').trim().toLowerCase();
+      const threshold = Number(raw.ransac_reproj_threshold ?? 5.0);
+      const confidence = Number(raw.confidence ?? 0.999);
+      const maxIterations = Number(raw.max_iterations ?? 10000);
+      return {
+        homography_method: ['auto', 'all_points', 'ransac', 'usac_magsac'].includes(method) ? method : 'auto',
+        ransac_reproj_threshold: Number.isFinite(threshold) && threshold > 0 ? threshold : 5.0,
+        confidence: Number.isFinite(confidence) && confidence > 0 && confidence <= 1.0 ? confidence : 0.999,
+        max_iterations: Number.isFinite(maxIterations) && maxIterations >= 1 ? Math.round(maxIterations) : 10000,
+      };
+    }
+
+    function setHomographyParameterInputs(raw = {}) {
+      const params = normalizeHomographyParameters(raw);
+      state.homographyParams = params;
+      els.homographyMethodSelect.value = params.homography_method;
+      els.homographyThresholdInput.value = String(params.ransac_reproj_threshold);
+      els.homographyConfidenceInput.value = String(params.confidence);
+      els.homographyIterationsInput.value = String(params.max_iterations);
+      const robustMode = params.homography_method !== 'all_points';
+      els.homographyThresholdInput.disabled = !robustMode;
+      els.homographyConfidenceInput.disabled = !robustMode;
+      els.homographyIterationsInput.disabled = !robustMode;
+      els.homographyParamsMeta.textContent = [
+        `homography params: method=${params.homography_method}`,
+        `threshold=${params.ransac_reproj_threshold.toFixed(1)}`,
+        `confidence=${params.confidence.toFixed(3)}`,
+        `max_iters=${params.max_iterations}`,
+      ].join(' | ');
+    }
+
+    function currentHomographyParameters() {
+      const params = normalizeHomographyParameters({
+        homography_method: els.homographyMethodSelect.value,
+        ransac_reproj_threshold: els.homographyThresholdInput.value,
+        confidence: els.homographyConfidenceInput.value,
+        max_iterations: els.homographyIterationsInput.value,
+      });
+      setHomographyParameterInputs(params);
+      return params;
+    }
+
     function setCoverageMode(enabled) {
       state.coverageMode = Boolean(enabled);
       els.coverageModeBtn.textContent = `Coverage Mode: ${state.coverageMode ? 'On' : 'Off'}`;
       els.coverageModeBtn.className = state.coverageMode ? 'warn' : '';
     }
 
+    function setLineMode(enabled) {
+      state.lineMode = Boolean(enabled);
+      els.lineModeBtn.textContent = `Line Mode: ${state.lineMode ? 'On' : 'Off'}`;
+      els.lineModeBtn.className = state.lineMode ? 'warn' : '';
+    }
+
+    function clearProjectionPreview() {
+      state.projectedPairs = [];
+    }
+
+    function setProjectionMode(enabled) {
+      state.projectionMode = Boolean(enabled);
+      if (state.projectionMode) {
+        setLineMode(false);
+        setCoverageMode(false);
+      } else {
+        clearProjectionPreview();
+      }
+      els.projectionModeBtn.textContent = `Projection Mode: ${state.projectionMode ? 'On' : 'Off'}`;
+      els.projectionModeBtn.className = state.projectionMode ? 'warn' : '';
+    }
+
     function normalizeCameraPointSpace(value) {
       return String(value || 'raw') === 'undistorted' ? 'undistorted' : 'raw';
+    }
+
+    function clearUndoStack() {
+      state.undoStack = [];
+    }
+
+    function pushUndoAction(action) {
+      state.undoStack.push(action);
     }
 
     function clonePoint(point) {
@@ -348,6 +478,25 @@
             : null,
         }))
         : [];
+      clearUndoStack();
+    }
+
+    function loadLineConstraints(rawLines) {
+      state.lineConstraints = Array.isArray(rawLines)
+        ? rawLines.map((line) => ({
+          points: Array.isArray(line)
+            ? line
+              .filter((point) => Array.isArray(point) && point.length === 2)
+              .map((point) => ({ x: Number(point[0]), y: Number(point[1]) }))
+            : [],
+        }))
+        : [];
+      if (state.lineConstraints.length < 1) {
+        state.activeLineIndex = -1;
+      } else if (state.activeLineIndex < 0 || state.activeLineIndex >= state.lineConstraints.length) {
+        state.activeLineIndex = state.lineConstraints.length - 1;
+      }
+      clearUndoStack();
     }
 
     function serializePointPairs() {
@@ -355,6 +504,12 @@
         camera_point: pair.camera ? [Number(pair.camera.x), Number(pair.camera.y)] : null,
         plan_point: pair.plan ? [Number(pair.plan.x), Number(pair.plan.y)] : null,
       }));
+    }
+
+    function serializeLineConstraints() {
+      return state.lineConstraints
+        .map((line) => line.points.map((point) => [Number(point.x), Number(point.y)]))
+        .filter((line) => line.length > 0);
     }
 
     function completePairs() {
@@ -372,6 +527,38 @@
       );
     }
 
+    function lineCount() {
+      return state.lineConstraints.length;
+    }
+
+    function linePointCount() {
+      return state.lineConstraints.reduce((count, line) => count + line.points.length, 0);
+    }
+
+    function readyLineCount() {
+      return state.lineConstraints.reduce((count, line) => count + (line.points.length >= 3 ? 1 : 0), 0);
+    }
+
+    function projectionMatrix() {
+      const cfg = currentCameraConfig(false);
+      const matrix = cfg?.matrix_ground || cfg?.matrix || state.matrix || null;
+      if (!Array.isArray(matrix) || matrix.length !== 3) return null;
+      if (!matrix.every((row) => Array.isArray(row) && row.length === 3)) return null;
+      return matrix;
+    }
+
+    function projectPointWithHomography(point, matrix) {
+      if (!point || !matrix) return null;
+      const x = Number(point.x);
+      const y = Number(point.y);
+      const w = (Number(matrix[2][0]) * x) + (Number(matrix[2][1]) * y) + Number(matrix[2][2]);
+      if (!Number.isFinite(w) || Math.abs(w) < 1e-9) return null;
+      const px = ((Number(matrix[0][0]) * x) + (Number(matrix[0][1]) * y) + Number(matrix[0][2])) / w;
+      const py = ((Number(matrix[1][0]) * x) + (Number(matrix[1][1]) * y) + Number(matrix[1][2])) / w;
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+      return { x: px, y: py };
+    }
+
     function resetComputedHomography() {
       state.matrix = null;
       state.reprojected = [];
@@ -383,6 +570,8 @@
       state.destinationCoverage = null;
       state.inliers = 0;
       state.inlierMask = [];
+      state.homographyEstimator = null;
+      setProjectionMode(false);
     }
 
     function clearComputedHomographyInConfig(cfg) {
@@ -393,14 +582,21 @@
       cfg.homography_stats = null;
     }
 
+    function clearLineBasedCalibrationInConfig(cfg) {
+      cfg.line_based_distortion = null;
+      cfg.line_based_stats = null;
+    }
+
     function syncCalibrationStateIntoEditor({
       includeCoverage = true,
       includeHomography = false,
       clearHomography = false,
+      clearLineBased = false,
     } = {}) {
       const cfg = currentCameraConfig(false);
       if (!cfg) return;
       cfg.point_pairs = serializePointPairs();
+      cfg.line_constraints = serializeLineConstraints();
       cfg.camera_points_space = normalizeCameraPointSpace(cfg.camera_points_space);
       if (includeCoverage) {
         cfg.coverage_polygon = state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]);
@@ -409,7 +605,11 @@
       if (clearHomography) {
         clearComputedHomographyInConfig(cfg);
       }
+      if (clearLineBased) {
+        clearLineBasedCalibrationInConfig(cfg);
+      }
       if (includeHomography) {
+        const homographyParams = currentHomographyParameters();
         cfg.matrix = state.matrix || cfg.matrix || null;
         cfg.matrix_ground = state.matrix || cfg.matrix_ground || cfg.matrix || null;
         cfg.homography_stats = {
@@ -421,7 +621,15 @@
           destination_coverage: state.destinationCoverage,
           inliers: state.inliers,
           total_pairs: completePairs().length,
+          estimator: state.homographyEstimator,
+          homography_method: homographyParams.homography_method,
+          ransac_reproj_threshold: homographyParams.ransac_reproj_threshold,
+          confidence: homographyParams.confidence,
+          max_iterations: homographyParams.max_iterations,
         };
+      }
+      if (state.lineBasedStats && typeof state.lineBasedStats === 'object') {
+        cfg.line_based_stats = state.lineBasedStats;
       }
       setCameraConfig(cfg);
     }
@@ -431,12 +639,12 @@
       const normalized = { x: Number(point.x), y: Number(point.y) };
       if (pair) {
         pair[side] = normalized;
-        return state.pointPairs.indexOf(pair);
+        return { pair, index: state.pointPairs.indexOf(pair) };
       }
       const next = { camera: null, plan: null };
       next[side] = normalized;
       state.pointPairs.push(next);
-      return state.pointPairs.length - 1;
+      return { pair: next, index: state.pointPairs.length - 1 };
     }
 
     function parseJsonArea(area, label, strict = true) {
@@ -486,8 +694,12 @@
     function syncStateFromCameraEditor() {
       const cfg = currentCameraConfig(false);
       if (!cfg) return;
+      clearProjectionPreview();
       if (Array.isArray(cfg.point_pairs)) {
         loadPointPairs(cfg.point_pairs);
+      }
+      if (Array.isArray(cfg.line_constraints)) {
+        loadLineConstraints(cfg.line_constraints);
       }
       if (Array.isArray(cfg.coverage_polygon)) {
         state.coveragePolygon = cfg.coverage_polygon.map((point) => ({
@@ -495,6 +707,9 @@
           y: Number(point[1]),
         }));
       }
+      state.lineBasedStats = (
+        cfg.line_based_stats && typeof cfg.line_based_stats === 'object'
+      ) ? cfg.line_based_stats : null;
       if (cfg.homography_stats && typeof cfg.homography_stats === 'object') {
         const stats = cfg.homography_stats;
         state.reprojError = Number(stats.reprojection_error ?? 0) || null;
@@ -505,6 +720,8 @@
         state.destinationCoverage = Number(stats.destination_coverage ?? 0) || null;
         state.inliers = Number(stats.inliers ?? 0) || 0;
         state.inlierMask = Array.isArray(stats.inlier_mask) ? stats.inlier_mask.map((value) => Boolean(value)) : [];
+        state.homographyEstimator = String(stats.estimator || '');
+        setHomographyParameterInputs(stats);
       } else {
         state.reprojError = null;
         state.inlierReprojError = null;
@@ -514,6 +731,8 @@
         state.destinationCoverage = null;
         state.inliers = 0;
         state.inlierMask = [];
+        state.homographyEstimator = null;
+        setHomographyParameterInputs();
       }
       state.matrix = cfg.matrix_ground || cfg.matrix || null;
     }
@@ -580,6 +799,7 @@
     }
 
     function blankCameraConfig(cameraId = '') {
+      const homographyParams = currentHomographyParameters();
       return {
         camera_id: String(cameraId || '').trim(),
         rtsp_url: '',
@@ -597,7 +817,15 @@
         distortion_correction_mode: 'point',
         coverage_polygon: [],
         point_pairs: [],
-        homography_stats: null,
+        line_constraints: [],
+        line_based_distortion: null,
+        line_based_stats: null,
+        homography_stats: {
+          homography_method: homographyParams.homography_method,
+          ransac_reproj_threshold: homographyParams.ransac_reproj_threshold,
+          confidence: homographyParams.confidence,
+          max_iterations: homographyParams.max_iterations,
+        },
       };
     }
 
@@ -619,6 +847,9 @@
         distortion_correction_mode: String(meta.distortion_correction_mode || 'point'),
         coverage_polygon: (meta.coverage_polygon || []).map((point) => [Number(point[0]), Number(point[1])]),
         point_pairs: meta.point_pairs || [],
+        line_constraints: meta.line_constraints || [],
+        line_based_distortion: meta.line_based_distortion || null,
+        line_based_stats: meta.line_based_stats || null,
         homography_stats: meta.homography_stats || null,
       };
     }
@@ -645,12 +876,21 @@
       const cameraSize = (els.cameraImg.naturalWidth && els.cameraImg.naturalHeight)
         ? `${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight}`
         : 'no frame';
+      const lineStats = [];
+      if (state.lineBasedStats?.mean_line_error != null) {
+        lineStats.push(`line_err=${Number(state.lineBasedStats.mean_line_error).toFixed(3)}`);
+      }
+      if (state.projectionMode) {
+        lineStats.push(`projected=${state.projectedPairs.length}`);
+      }
       els.cameraStageMeta.textContent = [
         cameraId || 'unsaved camera',
         cameraSize,
         `space=${normalizeCameraPointSpace(cfg?.camera_points_space)}`,
         `points=${pointCount('camera')}`,
         `pairs=${completePairs().length}/${state.pointPairs.length}`,
+        `lines=${readyLineCount()}/${lineCount()}`,
+        ...lineStats,
       ].join(' | ');
       const planName = String(els.planSelect.value || cfg?.floor_plan_filename || '');
       const planSize = (els.planImg.naturalWidth && els.planImg.naturalHeight)
@@ -676,8 +916,26 @@
       const noIncompletePairs = incompletePairCount() === 0;
       els.computeBtn.disabled = !(pairCount >= 4 && noIncompletePairs);
       const cfg = currentCameraConfig(false);
+      const mode = String(cfg?.distortion_correction_mode || 'point');
+      const hasBoardDistortion = Boolean(
+        cfg
+        && Array.isArray(cfg.intrinsic_matrix)
+        && Array.isArray(cfg.distortion_coefficients)
+      );
+      const hasLineDistortion = Boolean(cfg && cfg.line_based_distortion);
+      const hasProjection = Boolean(projectionMatrix());
       els.saveBtn.disabled = !(cfg && String(cfg.camera_id || '').trim() && String(els.planSelect.value || '').trim());
       els.saveSiteBtn.disabled = !(currentSiteConfig(false));
+      els.captureUndistortedBtn.disabled = !(
+        mode === 'line_based_v1' ? hasLineDistortion : hasBoardDistortion
+      );
+      els.captureBoardUndistortedBtn.disabled = !hasBoardDistortion;
+      els.captureLineUndistortedBtn.disabled = !hasLineDistortion;
+      els.projectionModeBtn.disabled = !hasProjection;
+      els.undoBtn.disabled = state.undoStack.length < 1;
+      els.clearLinesBtn.disabled = linePointCount() < 1;
+      els.calibrateLineBtn.disabled = !(readyLineCount() >= 2 && linePointCount() >= 8);
+      els.lineMeta.textContent = `line constraints: lines=${lineCount()} | ready=${readyLineCount()} | points=${linePointCount()}${state.activeLineIndex >= 0 ? ` | active=L${state.activeLineIndex + 1}` : ''}`;
       updateStageMeta();
       updateChessboardSourceMeta();
     }
@@ -724,11 +982,48 @@
       ctx.restore();
     }
 
-    function drawPoints(canvas, img, points, side, color, reprojected = [], polygon = [], guides = null) {
+    function drawLineConstraints(ctx, img, canvas) {
+      const cfg = currentCameraConfig(false);
+      if (normalizeCameraPointSpace(cfg?.camera_points_space) === 'undistorted') {
+        return;
+      }
+      state.lineConstraints.forEach((line, lineIdx) => {
+        const points = Array.isArray(line.points) ? line.points : [];
+        if (!points.length) return;
+        const active = lineIdx === state.activeLineIndex;
+        const stroke = active ? '#4db7ff' : '#63d9be';
+        ctx.save();
+        ctx.strokeStyle = stroke;
+        ctx.fillStyle = stroke;
+        ctx.lineWidth = active ? 2.5 : 1.5;
+        if (points.length >= 2) {
+          ctx.beginPath();
+          points.forEach((point, pointIdx) => {
+            const p = toScreenCoords(point, img, canvas);
+            if (pointIdx === 0) ctx.moveTo(p.x, p.y);
+            else ctx.lineTo(p.x, p.y);
+          });
+          ctx.stroke();
+        }
+        points.forEach((point, pointIdx) => {
+          const p = toScreenCoords(point, img, canvas);
+          ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+          if (pointIdx === 0) {
+            ctx.fillText(`L${lineIdx + 1}`, p.x + 8, p.y + 12);
+          }
+        });
+        ctx.restore();
+      });
+    }
+
+    function drawPoints(canvas, img, points, side, color, reprojected = [], polygon = [], guides = null, projected = []) {
       fitCanvas(img, canvas);
       const ctx = canvas.getContext('2d');
       const completed = completePairs();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (side === 'camera') {
+        drawLineConstraints(ctx, img, canvas);
+      }
       if (guides) {
         const guidePoint = toScreenCoords(guides, img, canvas);
         ctx.save();
@@ -802,11 +1097,22 @@
         drawXMarker(ctx, p, stroke, 6.5, 1.35);
         ctx.fillText(String(idx + 1), p.x + 8, p.y - 8);
       });
+
+      projected.forEach((point, idx) => {
+        if (!point) return;
+        const p = toScreenCoords(point, img, canvas);
+        const stroke = side === 'camera' ? '#4db7ff' : '#ff77aa';
+        drawXMarker(ctx, p, stroke, 8, 1.2);
+        ctx.fillStyle = stroke;
+        ctx.fillText(`P${idx + 1}`, p.x + 8, p.y - 8);
+      });
     }
 
     function redraw() {
       const cameraPoints = state.pointPairs.map((pair) => clonePoint(pair.camera));
       const planPoints = state.pointPairs.map((pair) => clonePoint(pair.plan));
+      const projectedCameraPoints = state.projectedPairs.map((pair) => clonePoint(pair.camera));
+      const projectedPlanPoints = state.projectedPairs.map((pair) => clonePoint(pair.plan));
       drawPoints(
         els.cameraCanvas,
         els.cameraImg,
@@ -816,6 +1122,7 @@
         [],
         [],
         null,
+        projectedCameraPoints,
       );
       drawPoints(
         els.planCanvas,
@@ -826,6 +1133,7 @@
         state.reprojected,
         state.coveragePolygon,
         state.hoverGuides.plan,
+        projectedPlanPoints,
       );
       updateButtons();
     }
@@ -853,30 +1161,118 @@
       return bestDist <= 14 ? best : -1;
     }
 
+    function nearestLinePoint(img, canvas, evt) {
+      const rect = canvas.getBoundingClientRect();
+      const mx = evt.clientX - rect.left;
+      const my = evt.clientY - rect.top;
+      let best = { lineIdx: -1, pointIdx: -1, dist: 1e9 };
+      state.lineConstraints.forEach((line, lineIdx) => {
+        line.points.forEach((point, pointIdx) => {
+          const p = toScreenCoords(point, img, canvas);
+          const dx = p.x - mx;
+          const dy = p.y - my;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < best.dist) {
+            best = { lineIdx, pointIdx, dist };
+          }
+        });
+      });
+      return best.dist <= 14 ? best : { lineIdx: -1, pointIdx: -1, dist: best.dist };
+    }
+
     function wireCanvas(canvas, img, side) {
       const guideKey = side === 'plan' ? 'plan' : null;
       canvas.addEventListener('click', (evt) => {
         if (state.drag.target) return;
         const point = toImageCoords(evt, img, canvas);
+        if (side === 'camera' && state.projectionMode) {
+          const matrix = projectionMatrix();
+          if (!matrix) {
+            setStatus('homography matrix is required for projection mode', 'bad');
+            return;
+          }
+          const projected = projectPointWithHomography(point, matrix);
+          if (!projected) {
+            setStatus('failed to project point with current homography', 'bad');
+            return;
+          }
+          state.projectedPairs.push({
+            camera: { x: point.x, y: point.y },
+            plan: projected,
+          });
+          setStatus(`projected point P${state.projectedPairs.length} onto plan`, 'good');
+          redraw();
+          return;
+        }
+        if (state.projectionMode) {
+          setStatus('projection mode is read-only: click camera frame to preview projected points', 'warn');
+          return;
+        }
+        if (side === 'camera' && state.lineMode) {
+          ensureActiveLine();
+          const lineRef = state.lineConstraints[state.activeLineIndex];
+          const pointRef = { x: point.x, y: point.y };
+          lineRef.points.push(pointRef);
+          pushUndoAction({ type: 'linePoint', lineRef, pointRef });
+          state.lineBasedStats = null;
+          syncCalibrationStateIntoEditor({
+            includeCoverage: false,
+            includeHomography: false,
+            clearLineBased: true,
+          });
+          setStatus(
+            `line L${state.activeLineIndex + 1} point #${state.lineConstraints[state.activeLineIndex].points.length} added`,
+            'warn',
+          );
+          redraw();
+          return;
+        }
         const targetKey = (side === 'plan' && state.coverageMode) ? 'coveragePolygon' : side;
         if (targetKey === 'coveragePolygon') {
           state.coveragePolygon.push({ x: point.x, y: point.y });
           syncCoverageIntoEditor();
           setStatus(`coverage point #${state.coveragePolygon.length} added`, 'warn');
         } else {
-          const pairIdx = addPointForSide(targetKey, point);
+          const added = addPointForSide(targetKey, point);
+          pushUndoAction({ type: 'pairPoint', pairRef: added.pair, side: targetKey });
           resetComputedHomography();
           syncCalibrationStateIntoEditor({
             includeCoverage: false,
             includeHomography: false,
             clearHomography: true,
           });
-          setStatus(`pair #${pairIdx + 1} updated on ${targetKey}`, 'warn');
+          setStatus(`pair #${added.index + 1} updated on ${targetKey}`, 'warn');
         }
         redraw();
       });
       canvas.addEventListener('contextmenu', (evt) => {
         evt.preventDefault();
+        if (state.projectionMode) {
+          return;
+        }
+        if (side === 'camera' && state.lineMode) {
+          const hit = nearestLinePoint(img, canvas, evt);
+          if (hit.lineIdx >= 0) {
+            const line = state.lineConstraints[hit.lineIdx];
+            line.points.splice(hit.pointIdx, 1);
+            if (line.points.length < 1) {
+              state.lineConstraints.splice(hit.lineIdx, 1);
+              if (state.activeLineIndex >= state.lineConstraints.length) {
+                state.activeLineIndex = state.lineConstraints.length - 1;
+              }
+            }
+            clearUndoStack();
+            state.lineBasedStats = null;
+            syncCalibrationStateIntoEditor({
+              includeCoverage: false,
+              includeHomography: false,
+              clearLineBased: true,
+            });
+            setStatus(`line point removed from L${hit.lineIdx + 1}`, 'warn');
+            redraw();
+          }
+          return;
+        }
         const targetKey = (side === 'plan' && state.coverageMode) ? 'coveragePolygon' : side;
         const idx = (targetKey === 'coveragePolygon')
           ? nearestPointIdx(state.coveragePolygon, img, canvas, evt)
@@ -889,6 +1285,7 @@
           } else {
             state.pointPairs.splice(idx, 1);
             resetComputedHomography();
+            clearUndoStack();
             syncCalibrationStateIntoEditor({
               includeCoverage: false,
               includeHomography: false,
@@ -900,12 +1297,23 @@
         }
       });
       canvas.addEventListener('mousedown', (evt) => {
+        if (state.projectionMode) {
+          return;
+        }
+        if (side === 'camera' && state.lineMode) {
+          const hit = nearestLinePoint(img, canvas, evt);
+          if (hit.lineIdx >= 0) {
+            state.activeLineIndex = hit.lineIdx;
+            state.drag = { target: 'linePoint', idx: hit.lineIdx, pointIdx: hit.pointIdx };
+          }
+          return;
+        }
         const targetKey = (side === 'plan' && state.coverageMode) ? 'coveragePolygon' : side;
         const idx = (targetKey === 'coveragePolygon')
           ? nearestPointIdx(state.coveragePolygon, img, canvas, evt)
           : nearestPointIdx(targetKey, img, canvas, evt);
         if (idx >= 0) {
-          state.drag = { target: targetKey, idx };
+          state.drag = { target: targetKey, idx, pointIdx: -1 };
         }
       });
       if (guideKey) {
@@ -919,6 +1327,22 @@
         });
       }
       window.addEventListener('mousemove', (evt) => {
+        if (side === 'camera' && state.drag.target === 'linePoint' && state.drag.idx >= 0 && state.drag.pointIdx >= 0) {
+          const point = toImageCoords(evt, img, canvas);
+          const line = state.lineConstraints[state.drag.idx];
+          if (line && line.points[state.drag.pointIdx]) {
+            line.points[state.drag.pointIdx] = { x: point.x, y: point.y };
+            clearUndoStack();
+            state.lineBasedStats = null;
+            syncCalibrationStateIntoEditor({
+              includeCoverage: false,
+              includeHomography: false,
+              clearLineBased: true,
+            });
+            redraw();
+          }
+          return;
+        }
         const targetKey = (side === 'plan' && state.drag.target === 'coveragePolygon') ? 'coveragePolygon' : side;
         if (state.drag.target !== targetKey || state.drag.idx < 0) return;
         const point = toImageCoords(evt, img, canvas);
@@ -928,6 +1352,7 @@
         } else if (state.pointPairs[state.drag.idx]) {
           state.pointPairs[state.drag.idx][targetKey] = { x: point.x, y: point.y };
           resetComputedHomography();
+          clearUndoStack();
           syncCalibrationStateIntoEditor({
             includeCoverage: false,
             includeHomography: false,
@@ -937,7 +1362,7 @@
         redraw();
       });
       window.addEventListener('mouseup', () => {
-        state.drag = { target: null, idx: -1 };
+        state.drag = { target: null, idx: -1, pointIdx: -1 };
       });
     }
 
@@ -1025,9 +1450,14 @@
       resetChessboardSources();
       const meta = state.cameraMetaById[normalizedCameraId];
       setCameraConfig(cameraConfigFromMeta(meta));
+      setHomographyParameterInputs(meta.homography_stats || {});
       loadPointPairs(meta.point_pairs || []);
+      loadLineConstraints(meta.line_constraints || []);
       resetComputedHomography();
       state.matrix = meta.homography_ground || meta.homography_matrix || null;
+      state.lineBasedStats = (
+        meta.line_based_stats && typeof meta.line_based_stats === 'object'
+      ) ? meta.line_based_stats : null;
       const stats = meta.homography_stats || {};
       state.reprojError = Number(stats.reprojection_error ?? 0) || null;
       state.inlierReprojError = Number(stats.inlier_reprojection_error ?? 0) || null;
@@ -1038,6 +1468,7 @@
       state.inliers = Number(stats.inliers ?? 0) || 0;
       state.inlierMask = Array.isArray(stats.inlier_mask) ? stats.inlier_mask.map((value) => Boolean(value)) : [];
       state.coveragePolygon = (meta.coverage_polygon || []).map((point) => ({ x: Number(point[0]), y: Number(point[1]) }));
+      setProjectionMode(false);
       const floorPlanName = String(meta.floor_plan_image || '');
       if (floorPlanName && state.floorPlans.includes(floorPlanName)) {
         els.planSelect.value = floorPlanName;
@@ -1050,8 +1481,14 @@
     function newCamera() {
       els.cameraSelect.value = '';
       resetChessboardSources();
+      setHomographyParameterInputs();
       state.pointPairs = [];
+      state.lineConstraints = [];
+      state.activeLineIndex = -1;
+      state.lineBasedStats = null;
       state.coveragePolygon = [];
+      setProjectionMode(false);
+      clearUndoStack();
       resetComputedHomography();
       setCameraConfig(blankCameraConfig(''));
       setStatus('new camera draft ready', 'warn');
@@ -1069,8 +1506,9 @@
       );
     }
 
-    async function requestCameraFrameBlob({ applyUndistort = false } = {}) {
+    async function requestCameraFrameBlob({ applyUndistort = false, distortionModeOverride = null } = {}) {
       const cfg = currentCameraConfig(true);
+      const mode = String(distortionModeOverride || cfg.distortion_correction_mode || 'point');
       const payload = {
         camera_id: String(cfg.camera_id || '').trim() || null,
         rtsp_url: String(cfg.rtsp_url || '').trim() || null,
@@ -1078,14 +1516,23 @@
         frame_height: (cfg.frame_height == null || cfg.frame_height === '' ? null : Number(cfg.frame_height)),
         intrinsic_matrix: cfg.intrinsic_matrix || null,
         distortion_coefficients: cfg.distortion_coefficients || null,
+        distortion_correction_mode: mode,
+        line_based_distortion: cfg.line_based_distortion || null,
         apply_undistort: Boolean(applyUndistort),
         undistort_alpha: 0.0,
       };
       if (!payload.camera_id && !payload.rtsp_url) {
         throw new Error('camera_id or rtsp_url is required to capture a frame');
       }
-      if (applyUndistort && (!payload.intrinsic_matrix || !payload.distortion_coefficients)) {
+      if (
+        applyUndistort
+        && mode !== 'line_based_v1'
+        && (!payload.intrinsic_matrix || !payload.distortion_coefficients)
+      ) {
         throw new Error('intrinsic_matrix and distortion_coefficients are required for undistorted capture');
+      }
+      if (applyUndistort && mode === 'line_based_v1' && !payload.line_based_distortion) {
+        throw new Error('line_based_distortion is required for line-based undistorted capture');
       }
       setStatus(applyUndistort ? 'capturing undistorted frame...' : 'capturing frame...', 'warn');
       const r = await fetch('/api/camera/frame', {
@@ -1099,7 +1546,7 @@
       return await r.blob();
     }
 
-    async function setCameraFrameFromBlob(blob, { applyUndistort = false } = {}) {
+    async function setCameraFrameFromBlob(blob, { applyUndistort = false, preserveCameraPointSpace = false } = {}) {
       if (state.cameraFrameObjectUrl) {
         URL.revokeObjectURL(state.cameraFrameObjectUrl);
       }
@@ -1109,7 +1556,9 @@
       const nextCfg = currentCameraConfig(true);
       if (!nextCfg.frame_width) nextCfg.frame_width = Number(els.cameraImg.naturalWidth || state.configMeta?.camera_frame_width || 0) || null;
       if (!nextCfg.frame_height) nextCfg.frame_height = Number(els.cameraImg.naturalHeight || state.configMeta?.camera_frame_height || 0) || null;
-      if (pointCount('camera') === 0) {
+      if (preserveCameraPointSpace) {
+        nextCfg.camera_points_space = normalizeCameraPointSpace(nextCfg.camera_points_space);
+      } else if (pointCount('camera') === 0) {
         nextCfg.camera_points_space = applyUndistort ? 'undistorted' : 'raw';
       } else {
         nextCfg.camera_points_space = normalizeCameraPointSpace(nextCfg.camera_points_space);
@@ -1127,6 +1576,7 @@
       const totalCameraPoints = pointCount('camera');
       if (totalCameraPoints < 1) return 0;
       if (normalizeCameraPointSpace(cfg.camera_points_space) === 'undistorted') return 0;
+      const mode = String(cfg.distortion_correction_mode || 'point');
 
       const payload = {
         points: state.pointPairs.map((pair) => (
@@ -1134,11 +1584,16 @@
         )),
         intrinsic_matrix: cfg.intrinsic_matrix || null,
         distortion_coefficients: cfg.distortion_coefficients || null,
+        distortion_correction_mode: mode,
+        line_based_distortion: cfg.line_based_distortion || null,
         image_width: Number(cfg.frame_width || els.cameraImg.naturalWidth || 0),
         image_height: Number(cfg.frame_height || els.cameraImg.naturalHeight || 0),
         alpha: Number(alpha || 0),
       };
-      if (!payload.intrinsic_matrix || !payload.distortion_coefficients) {
+      if (mode === 'line_based_v1' && !payload.line_based_distortion) {
+        throw new Error('line_based_distortion is required to remap points');
+      }
+      if (mode !== 'line_based_v1' && (!payload.intrinsic_matrix || !payload.distortion_coefficients)) {
         throw new Error('intrinsic_matrix and distortion_coefficients are required to remap points');
       }
       if (!(payload.image_width > 0 && payload.image_height > 0)) {
@@ -1158,6 +1613,7 @@
         if (!point || !state.pointPairs[idx]) return;
         state.pointPairs[idx].camera = { x: Number(point[0]), y: Number(point[1]) };
       });
+      clearUndoStack();
       resetComputedHomography();
       cfg.camera_points_space = 'undistorted';
       cfg.point_pairs = serializePointPairs();
@@ -1167,10 +1623,19 @@
       return totalCameraPoints;
     }
 
-    async function captureFrame({ applyUndistort = false } = {}) {
-      const blob = await requestCameraFrameBlob({ applyUndistort });
-      await setCameraFrameFromBlob(blob, { applyUndistort });
+    async function captureFrame({ applyUndistort = false, distortionModeOverride = null, preserveCameraPointSpace = false } = {}) {
+      const blob = await requestCameraFrameBlob({ applyUndistort, distortionModeOverride });
+      await setCameraFrameFromBlob(blob, { applyUndistort, preserveCameraPointSpace });
       if (applyUndistort) {
+        if (preserveCameraPointSpace) {
+          if (pointCount('camera') > 0) {
+            setStatus(
+              `undistorted preview captured: ${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight} | saved camera points not remapped`,
+              'warn',
+            );
+          }
+          return;
+        }
         const remappedCount = await remapCameraPointsToUndistortedFrame({ alpha: 0.0 });
         if (remappedCount > 0) {
           setStatus(
@@ -1184,6 +1649,16 @@
       if (pointCount('camera') > 0 && normalizeCameraPointSpace(cfg?.camera_points_space) === 'undistorted') {
         setStatus('raw frame captured | saved camera points are undistorted and may not align', 'warn');
       }
+    }
+
+    async function captureUndistortedPreview(mode, label) {
+      await captureFrame({
+        applyUndistort: true,
+        distortionModeOverride: mode,
+        preserveCameraPointSpace: true,
+      });
+      const suffix = pointCount('camera') > 0 ? ' | preview only; points kept in their original space' : '';
+      setStatus(`${label} preview captured: ${els.cameraImg.naturalWidth}x${els.cameraImg.naturalHeight}${suffix}`, pointCount('camera') > 0 ? 'warn' : 'good');
     }
 
     async function captureChessboardFrame() {
@@ -1200,18 +1675,152 @@
       setStatus(`chessboard frame captured: ${capture.name} | total=${state.chessboardCaptures.length}`, 'good');
     }
 
+    function ensureActiveLine() {
+      if (state.activeLineIndex >= 0 && state.activeLineIndex < state.lineConstraints.length) {
+        return state.activeLineIndex;
+      }
+      if (state.lineConstraints.length < 1) {
+        state.lineConstraints.push({ points: [] });
+      }
+      state.activeLineIndex = state.lineConstraints.length - 1;
+      return state.activeLineIndex;
+    }
+
+    function createNextLine() {
+      state.lineConstraints.push({ points: [] });
+      state.activeLineIndex = state.lineConstraints.length - 1;
+      state.lineBasedStats = null;
+      syncCalibrationStateIntoEditor({
+        includeCoverage: false,
+        includeHomography: false,
+        clearLineBased: true,
+      });
+      redraw();
+      setStatus(`new active line: L${state.activeLineIndex + 1}`, 'warn');
+    }
+
+    function undoLastPoint() {
+      while (state.undoStack.length) {
+        const action = state.undoStack.pop();
+        if (!action || !action.type) continue;
+        if (action.type === 'pairPoint' && action.pairRef && action.side) {
+          const pair = action.pairRef;
+          if (!pair[action.side]) continue;
+          pair[action.side] = null;
+          const pairIdx = state.pointPairs.indexOf(pair);
+          if (pairIdx >= 0 && !pair.camera && !pair.plan) {
+            state.pointPairs.splice(pairIdx, 1);
+          }
+          resetComputedHomography();
+          syncCalibrationStateIntoEditor({
+            includeCoverage: false,
+            includeHomography: false,
+            clearHomography: true,
+          });
+          redraw();
+          setStatus('last pair point removed', 'warn');
+          return true;
+        }
+        if (action.type === 'linePoint' && action.lineRef && action.pointRef) {
+          const line = action.lineRef;
+          const pointIdx = Array.isArray(line.points) ? line.points.indexOf(action.pointRef) : -1;
+          if (pointIdx < 0) continue;
+          line.points.splice(pointIdx, 1);
+          const lineIdx = state.lineConstraints.indexOf(line);
+          if (lineIdx >= 0 && line.points.length < 1) {
+            state.lineConstraints.splice(lineIdx, 1);
+            if (state.activeLineIndex >= state.lineConstraints.length) {
+              state.activeLineIndex = state.lineConstraints.length - 1;
+            }
+          }
+          state.lineBasedStats = null;
+          syncCalibrationStateIntoEditor({
+            includeCoverage: false,
+            includeHomography: false,
+            clearLineBased: true,
+          });
+          redraw();
+          setStatus('last line point removed', 'warn');
+          return true;
+        }
+      }
+      setStatus('nothing to undo', 'warn');
+      redraw();
+      return false;
+    }
+
+    async function calibrateLineBasedDistortion() {
+      const cfg = currentCameraConfig(true);
+      const lines = serializeLineConstraints().filter((line) => line.length >= 3);
+      const imageWidth = Number(cfg.frame_width || els.cameraImg.naturalWidth || 0);
+      const imageHeight = Number(cfg.frame_height || els.cameraImg.naturalHeight || 0);
+      if (!(imageWidth > 0 && imageHeight > 0)) {
+        throw new Error('capture a camera frame before line-based calibration');
+      }
+      if (lines.length < 2) {
+        throw new Error('need at least 2 lines with 3 or more points each');
+      }
+      const principalPoint = (
+        Array.isArray(cfg.intrinsic_matrix)
+        && Array.isArray(cfg.intrinsic_matrix[0])
+        && Array.isArray(cfg.intrinsic_matrix[1])
+      )
+        ? [Number(cfg.intrinsic_matrix[0][2]), Number(cfg.intrinsic_matrix[1][2])]
+        : null;
+      setStatus(`calibrating line-based distortion from ${lines.length} lines...`, 'warn');
+      const response = await fetch('/api/distortion/line-based', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          lines,
+          image_width: imageWidth,
+          image_height: imageHeight,
+          principal_point: principalPoint,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      cfg.line_constraints = serializeLineConstraints();
+      cfg.line_based_distortion = body.model || null;
+      cfg.line_based_stats = {
+        mean_line_error: Number(body.mean_line_error || 0),
+        max_line_error: Number(body.max_line_error || 0),
+        line_errors: Array.isArray(body.line_errors) ? body.line_errors.map((value) => Number(value)) : [],
+        line_count: Number(body.line_count || 0),
+        total_points: Number(body.total_points || 0),
+      };
+      cfg.distortion_correction_mode = 'line_based_v1';
+      state.lineBasedStats = cfg.line_based_stats;
+      setCameraConfig(cfg);
+      redraw();
+      setStatus(
+        `line-based distortion ok | mean=${Number(body.mean_line_error || 0).toFixed(3)} px | max=${Number(body.max_line_error || 0).toFixed(3)} px | k1=${Number(body.model?.k1 || 0).toFixed(6)}`,
+        'good',
+      );
+    }
+
     async function computeHomography() {
       const pairs = completePairs();
       if (pairs.length < 4 || incompletePairCount() > 0) {
         throw new Error('need at least 4 complete pairs and no incomplete pairs');
       }
-      setStatus('computing homography...', 'warn');
+      const homographyParams = currentHomographyParameters();
+      setStatus(
+        `computing homography... method=${homographyParams.homography_method} | threshold=${homographyParams.ransac_reproj_threshold.toFixed(1)} | confidence=${homographyParams.confidence.toFixed(3)} | max_iters=${homographyParams.max_iterations}`,
+        'warn',
+      );
       const r = await fetch('/api/compute-homography', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           src_points: pairs.map((pair) => [pair.camera.x, pair.camera.y]),
           dst_points: pairs.map((pair) => [pair.plan.x, pair.plan.y]),
+          homography_method: homographyParams.homography_method,
+          ransac_reproj_threshold: homographyParams.ransac_reproj_threshold,
+          confidence: homographyParams.confidence,
+          max_iterations: homographyParams.max_iterations,
         }),
       });
       if (!r.ok) {
@@ -1228,10 +1837,16 @@
       state.destinationCoverage = Number(body.destination_coverage || 0);
       state.inliers = Number(body.inliers || 0);
       state.inlierMask = Array.isArray(body.inlier_mask) ? body.inlier_mask.map((value) => Boolean(value)) : [];
-      const estimator = String(body.estimator || 'RANSAC');
+      state.homographyEstimator = String(body.estimator || 'RANSAC');
+      setHomographyParameterInputs({
+        homography_method: body.homography_method,
+        ransac_reproj_threshold: body.ransac_reproj_threshold,
+        confidence: body.confidence,
+        max_iterations: body.max_iterations,
+      });
       syncCalibrationStateIntoEditor({ includeCoverage: false, includeHomography: true });
       setStatus(
-        `homography ok | ${estimator} | mean=${state.reprojError.toFixed(3)} px | inlier=${state.inlierReprojError.toFixed(3)} px | inliers=${state.inliers}/${pairs.length}`,
+        `homography ok | method=${state.homographyParams.homography_method} | estimator=${state.homographyEstimator} | thr=${state.homographyParams.ransac_reproj_threshold.toFixed(1)} | mean=${state.reprojError.toFixed(3)} px | inlier=${state.inlierReprojError.toFixed(3)} px | inliers=${state.inliers}/${pairs.length}`,
         'good',
       );
       redraw();
@@ -1283,6 +1898,7 @@
 
     async function saveCameraConfig() {
       const cfg = currentCameraConfig(true);
+      const homographyParams = currentHomographyParameters();
       const cameraId = String(cfg.camera_id || '').trim();
       if (!cameraId) {
         throw new Error('camera_id is required');
@@ -1309,6 +1925,9 @@
         distortion_correction_mode: String(cfg.distortion_correction_mode || 'point'),
         coverage_polygon: state.coveragePolygon.map((point) => [Number(point.x), Number(point.y)]),
         point_pairs: serializePointPairs(),
+        line_constraints: serializeLineConstraints(),
+        line_based_distortion: cfg.line_based_distortion || null,
+        line_based_stats: cfg.line_based_stats || state.lineBasedStats || null,
         homography_stats: {
           reprojection_error: state.reprojError,
           inlier_reprojection_error: state.inlierReprojError,
@@ -1319,6 +1938,11 @@
           inliers: state.inliers,
           total_pairs: completePairs().length,
           inlier_mask: state.inlierMask,
+          estimator: state.homographyEstimator,
+          homography_method: homographyParams.homography_method,
+          ransac_reproj_threshold: homographyParams.ransac_reproj_threshold,
+          confidence: homographyParams.confidence,
+          max_iterations: homographyParams.max_iterations,
         },
       };
       setStatus(`saving ${cameraId}...`, 'warn');
@@ -1405,6 +2029,13 @@
           setStatus(String(e.message || e), 'bad');
         }
       });
+      els.captureBoardUndistortedBtn.addEventListener('click', async () => {
+        try {
+          await captureUndistortedPreview('frame_preprocess', 'board-based undistort');
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
       els.captureChessboardBtn.addEventListener('click', async () => {
         try {
           await captureChessboardFrame();
@@ -1422,6 +2053,55 @@
         } catch (e) {
           setStatus(String(e.message || e), 'bad');
         }
+      });
+      els.lineModeBtn.addEventListener('click', () => {
+        if (!state.lineMode) {
+          setProjectionMode(false);
+        }
+        setLineMode(!state.lineMode);
+        if (state.lineMode && state.activeLineIndex < 0 && state.lineConstraints.length < 1) {
+          createNextLine();
+          return;
+        }
+        redraw();
+      });
+      els.nextLineBtn.addEventListener('click', () => {
+        createNextLine();
+      });
+      els.clearLinesBtn.addEventListener('click', () => {
+        state.lineConstraints = [];
+        state.activeLineIndex = -1;
+        state.lineBasedStats = null;
+        clearUndoStack();
+        syncCalibrationStateIntoEditor({
+          includeCoverage: false,
+          includeHomography: false,
+          clearLineBased: true,
+        });
+        setStatus('line constraints cleared', 'warn');
+        redraw();
+      });
+      els.calibrateLineBtn.addEventListener('click', async () => {
+        try {
+          await calibrateLineBasedDistortion();
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      els.captureLineUndistortedBtn.addEventListener('click', async () => {
+        try {
+          await captureUndistortedPreview('line_based_v1', 'line-based undistort');
+        } catch (e) {
+          setStatus(String(e.message || e), 'bad');
+        }
+      });
+      [els.homographyThresholdInput, els.homographyConfidenceInput, els.homographyIterationsInput].forEach((input) => {
+        input.addEventListener('change', () => {
+          currentHomographyParameters();
+        });
+      });
+      els.homographyMethodSelect.addEventListener('change', () => {
+        currentHomographyParameters();
       });
       els.chessboardUploadInput.addEventListener('change', () => updateButtons());
       els.planSelect.addEventListener('change', async () => {
@@ -1471,19 +2151,35 @@
           setStatus(String(e.message || e), 'bad');
         }
       });
+      els.undoBtn.addEventListener('click', () => {
+        undoLastPoint();
+      });
       els.clearBtn.addEventListener('click', () => {
         state.pointPairs = [];
-        resetComputedHomography();
+        clearUndoStack();
         syncCalibrationStateIntoEditor({
           includeCoverage: false,
           includeHomography: false,
-          clearHomography: true,
         });
-        setStatus('paired points cleared', 'warn');
+        setStatus('paired points cleared | homography preserved', 'warn');
+        redraw();
+      });
+      els.projectionModeBtn.addEventListener('click', () => {
+        setProjectionMode(!state.projectionMode);
+        setStatus(
+          state.projectionMode
+            ? 'projection mode enabled: click camera frame to preview plan points'
+            : 'projection mode disabled: preview points cleared',
+          state.projectionMode ? 'warn' : 'good',
+        );
         redraw();
       });
       els.coverageModeBtn.addEventListener('click', () => {
+        if (!state.coverageMode) {
+          setProjectionMode(false);
+        }
         setCoverageMode(!state.coverageMode);
+        redraw();
       });
       els.clearCoverageBtn.addEventListener('click', () => {
         state.coveragePolygon = [];
@@ -1493,6 +2189,7 @@
       });
       els.cameraConfigEditor.addEventListener('input', () => {
         syncStateFromCameraEditor();
+        clearUndoStack();
         updateButtons();
         redraw();
       });
@@ -1505,6 +2202,8 @@
     async function init() {
       bind();
       setCoverageMode(false);
+      setLineMode(false);
+      setHomographyParameterInputs();
       renderChessboardCaptureStrip();
       await loadFloorPlans();
       await loadConfig();

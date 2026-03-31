@@ -15,6 +15,12 @@ import numpy as np
 
 from .geometry import apply_homography, validate_homography_matrix
 
+DEFAULT_RANSAC_REPROJ_THRESHOLD = 5.0
+DEFAULT_CONFIDENCE = 0.999
+DEFAULT_MAX_ITERATIONS = 10_000
+DEFAULT_HOMOGRAPHY_METHOD = "auto"
+HOMOGRAPHY_METHODS = {"auto", "all_points", "ransac", "usac_magsac"}
+
 
 @dataclass(frozen=True)
 class HomographyResult:
@@ -50,13 +56,25 @@ def _to_point_array(points: Iterable[tuple[float, float] | list[float]]) -> np.n
 def compute_homography(
     src_points: list[tuple[float, float]] | list[list[float]],
     dst_points: list[tuple[float, float]] | list[list[float]],
+    *,
+    homography_method: str = DEFAULT_HOMOGRAPHY_METHOD,
+    ransac_reproj_threshold: float = DEFAULT_RANSAC_REPROJ_THRESHOLD,
+    confidence: float = DEFAULT_CONFIDENCE,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> tuple[list[list[float]], float]:
     """Compute 3x3 homography from >=4 point pairs.
 
     Returns:
         (matrix_3x3_as_nested_lists, mean_reprojection_error_px)
     """
-    result = _compute_homography_impl(src_points, dst_points)
+    result = _compute_homography_impl(
+        src_points,
+        dst_points,
+        homography_method=homography_method,
+        ransac_reproj_threshold=ransac_reproj_threshold,
+        confidence=confidence,
+        max_iterations=max_iterations,
+    )
     return result.matrix, result.reprojection_error
 
 
@@ -82,6 +100,11 @@ def _coverage_ratio(points: np.ndarray) -> float:
 def _compute_homography_impl(
     src_points: list[tuple[float, float]] | list[list[float]],
     dst_points: list[tuple[float, float]] | list[list[float]],
+    *,
+    homography_method: str = DEFAULT_HOMOGRAPHY_METHOD,
+    ransac_reproj_threshold: float = DEFAULT_RANSAC_REPROJ_THRESHOLD,
+    confidence: float = DEFAULT_CONFIDENCE,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> HomographyResult:
     src = _to_point_array(src_points)
     dst = _to_point_array(dst_points)
@@ -93,15 +116,61 @@ def _compute_homography_impl(
         raise ValueError("At least 4 unique source points are required")
     if np.unique(dst, axis=0).shape[0] < 4:
         raise ValueError("At least 4 unique destination points are required")
+    homography_method = str(homography_method or DEFAULT_HOMOGRAPHY_METHOD).strip().lower()
+    if homography_method not in HOMOGRAPHY_METHODS:
+        raise ValueError(f"Unsupported homography_method: {homography_method}")
+    if not math.isfinite(ransac_reproj_threshold) or ransac_reproj_threshold <= 0.0:
+        raise ValueError("ransac_reproj_threshold must be positive")
+    if not math.isfinite(confidence) or confidence <= 0.0 or confidence > 1.0:
+        raise ValueError("confidence must be in (0, 1]")
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be >= 1")
 
     h_matrix = None
     inlier_mask = None
     estimator = "RANSAC"
-    if hasattr(cv2, "UsacParams") and hasattr(cv2, "SCORE_METHOD_MAGSAC"):
+    has_usac_magsac = hasattr(cv2, "UsacParams") and hasattr(cv2, "SCORE_METHOD_MAGSAC")
+
+    if homography_method == "all_points":
+        h_matrix, inlier_mask = cv2.findHomography(
+            src.astype(np.float32),
+            dst.astype(np.float32),
+            method=0,
+        )
+        estimator = "ALL_POINTS"
+    elif homography_method == "usac_magsac":
+        if not has_usac_magsac:
+            raise ValueError("USAC_MAGSAC is not available in this OpenCV build")
         params = cv2.UsacParams()
-        params.confidence = 0.999
-        params.maxIterations = 10_000
-        params.threshold = 5.0
+        params.confidence = float(confidence)
+        params.maxIterations = int(max_iterations)
+        params.threshold = float(ransac_reproj_threshold)
+        params.sampler = int(getattr(cv2, "SAMPLING_UNIFORM", 0))
+        params.score = int(getattr(cv2, "SCORE_METHOD_MAGSAC", 2))
+        params.loMethod = int(getattr(cv2, "LOCAL_OPTIM_SIGMA", 4))
+        params.loIterations = 10
+        params.neighborsSearch = int(getattr(cv2, "NEIGH_GRID", 1))
+        h_matrix, inlier_mask = cv2.findHomography(
+            src.astype(np.float32),
+            dst.astype(np.float32),
+            params=params,
+        )
+        estimator = "USAC_MAGSAC"
+    elif homography_method == "ransac":
+        h_matrix, inlier_mask = cv2.findHomography(
+            src.astype(np.float32),
+            dst.astype(np.float32),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=float(ransac_reproj_threshold),
+            maxIters=int(max_iterations),
+            confidence=float(confidence),
+        )
+        estimator = "RANSAC"
+    elif has_usac_magsac:
+        params = cv2.UsacParams()
+        params.confidence = float(confidence)
+        params.maxIterations = int(max_iterations)
+        params.threshold = float(ransac_reproj_threshold)
         params.sampler = int(getattr(cv2, "SAMPLING_UNIFORM", 0))
         params.score = int(getattr(cv2, "SCORE_METHOD_MAGSAC", 2))
         params.loMethod = int(getattr(cv2, "LOCAL_OPTIM_SIGMA", 4))
@@ -119,16 +188,21 @@ def _compute_homography_impl(
             h_matrix = None
             inlier_mask = None
             estimator = "RANSAC"
-    if h_matrix is None:
+    if h_matrix is None and homography_method == "auto":
         h_matrix, inlier_mask = cv2.findHomography(
             src.astype(np.float32),
             dst.astype(np.float32),
             method=cv2.RANSAC,
-            ransacReprojThreshold=5.0,
+            ransacReprojThreshold=float(ransac_reproj_threshold),
+            maxIters=int(max_iterations),
+            confidence=float(confidence),
         )
+        estimator = "RANSAC"
     if h_matrix is None:
         raise ValueError("Failed to compute homography")
 
+    if homography_method == "all_points":
+        inlier_mask = np.ones((src.shape[0], 1), dtype=np.uint8)
     inliers = 0
     if inlier_mask is not None:
         inliers = int(np.asarray(inlier_mask, dtype=np.int32).reshape(-1).sum())

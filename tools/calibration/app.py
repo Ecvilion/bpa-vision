@@ -20,7 +20,7 @@ import numpy as np
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .distortion import (
     calibrate_camera_from_chessboard_images,
@@ -28,7 +28,18 @@ from .distortion import (
     undistort_image,
     undistort_points,
 )
-from .homography import _compute_homography_impl
+from .homography import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_HOMOGRAPHY_METHOD,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_RANSAC_REPROJ_THRESHOLD,
+    _compute_homography_impl,
+)
+from .line_based import (
+    compute_line_based_distortion,
+    undistort_image_line_based,
+    undistort_points_line_based,
+)
 from .geometry import validate_homography_matrix
 
 
@@ -141,6 +152,10 @@ class CalibrationRuntime:
 class ComputeHomographyRequest(BaseModel):
     src_points: list[list[float]]
     dst_points: list[list[float]]
+    homography_method: Literal["auto", "all_points", "ransac", "usac_magsac"] = DEFAULT_HOMOGRAPHY_METHOD
+    ransac_reproj_threshold: float = Field(default=DEFAULT_RANSAC_REPROJ_THRESHOLD, gt=0.0)
+    confidence: float = Field(default=DEFAULT_CONFIDENCE, gt=0.0, le=1.0)
+    max_iterations: int = Field(default=DEFAULT_MAX_ITERATIONS, ge=1)
 
 
 class CalibrationPointPair(BaseModel):
@@ -165,6 +180,9 @@ class SaveCalibrationRequest(BaseModel):
     distortion_correction_mode: str | None = None
     coverage_polygon: list[list[float]] | None = None
     point_pairs: list[CalibrationPointPair] | None = None
+    line_constraints: list[list[list[float]]] | None = None
+    line_based_distortion: dict[str, Any] | None = None
+    line_based_stats: dict[str, Any] | None = None
     homography_stats: dict[str, Any] | None = None
 
 
@@ -180,17 +198,28 @@ class CaptureFrameRequest(BaseModel):
     frame_height: int | None = None
     intrinsic_matrix: list[list[float]] | None = None
     distortion_coefficients: list[float] | None = None
+    distortion_correction_mode: str | None = None
+    line_based_distortion: dict[str, Any] | None = None
     apply_undistort: bool = False
     undistort_alpha: float = 0.0
 
 
 class UndistortCameraPointsRequest(BaseModel):
     points: list[list[float] | None]
-    intrinsic_matrix: list[list[float]]
-    distortion_coefficients: list[float]
+    intrinsic_matrix: list[list[float]] | None = None
+    distortion_coefficients: list[float] | None = None
+    distortion_correction_mode: str | None = None
+    line_based_distortion: dict[str, Any] | None = None
     image_width: int
     image_height: int
     alpha: float = 0.0
+
+
+class ComputeLineBasedDistortionRequest(BaseModel):
+    lines: list[list[list[float]]]
+    image_width: int
+    image_height: int
+    principal_point: list[float] | None = None
 
 
 def capture_rtsp_frame(rtsp_url: str, *, timeout_sec: float = 5.0) -> bytes:
@@ -290,6 +319,9 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
                 "distortion_correction_mode": cal.get("distortion_correction_mode", "none"),
                 "coverage_polygon": cal.get("coverage_polygon", []),
                 "point_pairs": cal.get("point_pairs", []),
+                "line_constraints": cal.get("line_constraints", []),
+                "line_based_distortion": cal.get("line_based_distortion"),
+                "line_based_stats": cal.get("line_based_stats", {}),
                 "homography_stats": cal.get("homography_stats", {}),
             })
         return JSONResponse({"cameras": sorted(out, key=lambda x: x["camera_id"])})
@@ -339,7 +371,22 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
         target_h = req.frame_height or runtime.camera_frame_height
         jpeg = _resize_jpeg_if_needed(jpeg, width=target_w, height=target_h)
 
-        if req.apply_undistort and req.intrinsic_matrix and req.distortion_coefficients:
+        if (
+            req.apply_undistort
+            and req.distortion_correction_mode == "line_based_v1"
+            and req.line_based_distortion
+        ):
+            raw = np.frombuffer(jpeg, dtype=np.uint8)
+            frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            if frame is not None:
+                corrected = undistort_image_line_based(
+                    frame,
+                    model=req.line_based_distortion,
+                )
+                ok, encoded = cv2.imencode(".jpg", corrected)
+                if ok:
+                    jpeg = bytes(encoded.tobytes())
+        elif req.apply_undistort and req.intrinsic_matrix and req.distortion_coefficients:
             raw = np.frombuffer(jpeg, dtype=np.uint8)
             frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
             if frame is not None:
@@ -370,14 +417,28 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             filtered_points.append([float(point[0]), float(point[1])])
             filtered_indices.append(idx)
         try:
-            mapped_points, new_intrinsic_matrix, roi = undistort_points(
-                filtered_points,
-                intrinsic_matrix=req.intrinsic_matrix,
-                distortion_coefficients=req.distortion_coefficients,
-                image_width=req.image_width,
-                image_height=req.image_height,
-                alpha=req.alpha,
-            )
+            if req.distortion_correction_mode == "line_based_v1" and req.line_based_distortion:
+                mapped_points = undistort_points_line_based(
+                    filtered_points,
+                    model=req.line_based_distortion,
+                    image_width=req.image_width,
+                    image_height=req.image_height,
+                )
+                new_intrinsic_matrix = None
+                roi = (0, 0, int(req.image_width), int(req.image_height))
+            else:
+                if req.intrinsic_matrix is None or req.distortion_coefficients is None:
+                    raise ValueError(
+                        "intrinsic_matrix and distortion_coefficients are required",
+                    )
+                mapped_points, new_intrinsic_matrix, roi = undistort_points(
+                    filtered_points,
+                    intrinsic_matrix=req.intrinsic_matrix,
+                    distortion_coefficients=req.distortion_coefficients,
+                    image_width=req.image_width,
+                    image_height=req.image_height,
+                    alpha=req.alpha,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -391,10 +452,41 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             "roi": [int(v) for v in roi],
         })
 
+    @app.post("/api/distortion/line-based")
+    async def calibrate_line_based_distortion(req: ComputeLineBasedDistortionRequest) -> JSONResponse:
+        try:
+            result = compute_line_based_distortion(
+                req.lines,
+                image_width=req.image_width,
+                image_height=req.image_height,
+                principal_point=req.principal_point,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse({
+            "model": result.model,
+            "mean_line_error": result.mean_line_error,
+            "max_line_error": result.max_line_error,
+            "line_errors": result.line_errors,
+            "corrected_lines": [
+                [[float(point[0]), float(point[1])] for point in line]
+                for line in result.corrected_lines
+            ],
+            "line_count": result.line_count,
+            "total_points": result.total_points,
+        })
+
     @app.post("/api/compute-homography")  # also aliased below
     async def compute_homography_endpoint(req: ComputeHomographyRequest) -> JSONResponse:
         try:
-            result = _compute_homography_impl(req.src_points, req.dst_points)
+            result = _compute_homography_impl(
+                req.src_points,
+                req.dst_points,
+                homography_method=req.homography_method,
+                ransac_reproj_threshold=req.ransac_reproj_threshold,
+                confidence=req.confidence,
+                max_iterations=req.max_iterations,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return JSONResponse({
@@ -412,6 +504,10 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             "destination_coverage": result.destination_coverage,
             "inliers": result.inliers,
             "estimator": result.estimator,
+            "homography_method": req.homography_method,
+            "ransac_reproj_threshold": req.ransac_reproj_threshold,
+            "confidence": req.confidence,
+            "max_iterations": req.max_iterations,
         })
 
     @app.post("/api/save")
@@ -457,6 +553,12 @@ def create_calibration_app(runtime: CalibrationRuntime) -> FastAPI:
             cal["coverage_polygon"] = req.coverage_polygon
         if req.point_pairs is not None:
             cal["point_pairs"] = [pair.model_dump() for pair in req.point_pairs]
+        if req.line_constraints is not None:
+            cal["line_constraints"] = req.line_constraints
+        if req.line_based_distortion is not None:
+            cal["line_based_distortion"] = req.line_based_distortion
+        if req.line_based_stats is not None:
+            cal["line_based_stats"] = req.line_based_stats
         if req.homography_stats is not None:
             cal["homography_stats"] = req.homography_stats
 
